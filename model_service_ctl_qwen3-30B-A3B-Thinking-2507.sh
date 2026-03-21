@@ -5,14 +5,14 @@ set -euo pipefail
 # 通用 vLLM 容器管理脚本（单服务版）
 # 当前默认环境：
 #   - 脚本目录: /opsfactory/model_service
-#   - 模型目录: /data/models/c4ai-command-r-08-2024
+#   - 模型目录: /data/models/Qwen3-30B-A3B-Thinking-2507
 #######################################
 
 #######################################
 # Script Meta
 #######################################
 SCRIPT_NAME="$(basename "$0")"
-SCRIPT_VERSION="0.3"
+SCRIPT_VERSION="2.0"
 BASE_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 ROOT_LOG_DIR="${BASE_DIR}/logs"
@@ -38,9 +38,9 @@ API_KEY="${API_KEY:-change-me}"
 MODELS_ROOT="${MODELS_ROOT:-/data/models}"
 HF_CACHE="${HF_CACHE:-/data/hf_cache}"
 
-CONTAINER_NAME="${CONTAINER_NAME:-vllm-c4ai-command-r-08-2024}"
-MODEL_DIR="${MODEL_DIR:-/data/models/c4ai-command-r-08-2024}"
-MODEL_NAME="${MODEL_NAME:-c4ai-command-r-08-2024}"
+CONTAINER_NAME="${CONTAINER_NAME:-vllm-qwen3-30b-a3b-thinking-2507}"
+MODEL_DIR="${MODEL_DIR:-/data/models/Qwen3-30B-A3B-Thinking-2507}"
+MODEL_NAME="${MODEL_NAME:-Qwen3-30B-A3B-Thinking-2507}"
 
 HOST_PORT="${HOST_PORT:-8000}"
 CONTAINER_PORT="${CONTAINER_PORT:-8000}"
@@ -50,22 +50,21 @@ TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-4}"
 
 DTYPE="${DTYPE:-float16}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.85}"
-# The model card states 128K context length, but default to 32K first to keep
-# startup pressure lower. Raise it via environment override if needed.
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
+# Official Qwen guidance for this model uses 262144 context on vLLM. Keep it
+# as the default and let callers override if they want a lower startup target.
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-262144}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}"
 
-# Goose and similar OpenAI-compatible agents typically send tool_choice=auto
-# once tools are present. vLLM requires both auto-tool-choice and a parser to
-# be enabled server-side for that path to work. Command-R does not currently
-# have a dedicated vLLM parser. Its official tool-use format is a JSON action
-# list rendered via the Hugging Face tool-use API / tool_use chat template, so
-# default to xLAM's generic JSON-array parser first and keep everything
-# overrideable via environment variables.
-TOOL_CALL_PARSER="${TOOL_CALL_PARSER:-xlam}"
+# vLLM's official Qwen tool-calling guidance uses the Hermes-style parser.
+# This model is thinking-only and the model card explicitly states that
+# specifying enable_thinking is no longer required. The vLLM image available in
+# this environment also rejects --enable-reasoning, so keep reasoning-related
+# CLI flags disabled by default.
+TOOL_CALL_PARSER="${TOOL_CALL_PARSER:-hermes}"
 REASONING_PARSER="${REASONING_PARSER:-}"
 ENABLE_AUTO_TOOL_CHOICE="${ENABLE_AUTO_TOOL_CHOICE:-1}"
-LANGUAGE_MODEL_ONLY="${LANGUAGE_MODEL_ONLY:-1}"
+ENABLE_REASONING="${ENABLE_REASONING:-0}"
+LANGUAGE_MODEL_ONLY="${LANGUAGE_MODEL_ONLY:-0}"
 CHAT_TEMPLATE="${CHAT_TEMPLATE:-}"
 TRUST_REMOTE_CODE="${TRUST_REMOTE_CODE:-0}"
 DISABLE_CUSTOM_ALL_REDUCE="${DISABLE_CUSTOM_ALL_REDUCE:-1}"
@@ -131,6 +130,7 @@ Current defaults:
   TOOL_CALL_PARSER=${TOOL_CALL_PARSER}
   REASONING_PARSER=${REASONING_PARSER}
   ENABLE_AUTO_TOOL_CHOICE=${ENABLE_AUTO_TOOL_CHOICE}
+  ENABLE_REASONING=${ENABLE_REASONING}
   LANGUAGE_MODEL_ONLY=${LANGUAGE_MODEL_ONLY}
   CHAT_TEMPLATE=${CHAT_TEMPLATE}
   TRUST_REMOTE_CODE=${TRUST_REMOTE_CODE}
@@ -300,6 +300,7 @@ save_env_snapshot() {
     echo "tool_call_parser=${TOOL_CALL_PARSER}"
     echo "reasoning_parser=${REASONING_PARSER}"
     echo "enable_auto_tool_choice=${ENABLE_AUTO_TOOL_CHOICE}"
+    echo "enable_reasoning=${ENABLE_REASONING}"
     echo "language_model_only=${LANGUAGE_MODEL_ONLY}"
     echo "chat_template=${CHAT_TEMPLATE}"
     echo "trust_remote_code=${TRUST_REMOTE_CODE}"
@@ -466,6 +467,10 @@ build_run_cmd() {
 
   if [[ "${ENABLE_AUTO_TOOL_CHOICE}" == "1" ]]; then
     cmd+=(--enable-auto-tool-choice)
+  fi
+
+  if [[ "${ENABLE_REASONING}" == "1" ]]; then
+    cmd+=(--enable-reasoning)
   fi
 
   if [[ -n "${CHAT_TEMPLATE}" ]]; then
@@ -691,6 +696,7 @@ collect_failure_context() {
     echo "tool_call_parser=${TOOL_CALL_PARSER}"
     echo "reasoning_parser=${REASONING_PARSER}"
     echo "enable_auto_tool_choice=${ENABLE_AUTO_TOOL_CHOICE}"
+    echo "enable_reasoning=${ENABLE_REASONING}"
     echo "language_model_only=${LANGUAGE_MODEL_ONLY}"
     echo "chat_template=${CHAT_TEMPLATE}"
     echo "trust_remote_code=${TRUST_REMOTE_CODE}"
@@ -902,6 +908,7 @@ status_service() {
   echo "TOOL_CALL_PARSER : ${TOOL_CALL_PARSER}" | tee -a "${RUN_LOG}"
   echo "REASONING_PARSER : ${REASONING_PARSER}" | tee -a "${RUN_LOG}"
   echo "ENABLE_AUTO_TOOL_CHOICE : ${ENABLE_AUTO_TOOL_CHOICE}" | tee -a "${RUN_LOG}"
+  echo "ENABLE_REASONING : ${ENABLE_REASONING}" | tee -a "${RUN_LOG}"
   echo "CHAT_TEMPLATE : ${CHAT_TEMPLATE}" | tee -a "${RUN_LOG}"
   echo "LANGUAGE_MODEL_ONLY : ${LANGUAGE_MODEL_ONLY}" | tee -a "${RUN_LOG}"
   echo "TRUST_REMOTE_CODE : ${TRUST_REMOTE_CODE}" | tee -a "${RUN_LOG}"

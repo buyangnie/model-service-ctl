@@ -5,14 +5,19 @@ set -euo pipefail
 # 通用 vLLM 容器管理脚本（单服务版）
 # 当前默认环境：
 #   - 脚本目录: /opsfactory/model_service
-#   - 模型目录: /data/models/c4ai-command-r-08-2024
+#   - 模型目录: /data/models/Qwen3-32B
+#
+# Notes:
+#   - Qwen3-32B 默认开启 thinking。
+#   - 若线上追求更低 TTFT，建议在客户端 prompt 或 system message 中显式附加 `/no_think`。
+#   - vLLM 官方 Qwen tool calling 建议使用 `--tool-call-parser hermes`。
 #######################################
 
 #######################################
 # Script Meta
 #######################################
 SCRIPT_NAME="$(basename "$0")"
-SCRIPT_VERSION="0.3"
+SCRIPT_VERSION="1.0"
 BASE_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 ROOT_LOG_DIR="${BASE_DIR}/logs"
@@ -38,9 +43,9 @@ API_KEY="${API_KEY:-change-me}"
 MODELS_ROOT="${MODELS_ROOT:-/data/models}"
 HF_CACHE="${HF_CACHE:-/data/hf_cache}"
 
-CONTAINER_NAME="${CONTAINER_NAME:-vllm-c4ai-command-r-08-2024}"
-MODEL_DIR="${MODEL_DIR:-/data/models/c4ai-command-r-08-2024}"
-MODEL_NAME="${MODEL_NAME:-c4ai-command-r-08-2024}"
+CONTAINER_NAME="${CONTAINER_NAME:-vllm-qwen3-32b}"
+MODEL_DIR="${MODEL_DIR:-/data/models/Qwen3-32B}"
+MODEL_NAME="${MODEL_NAME:-Qwen3-32B}"
 
 HOST_PORT="${HOST_PORT:-8000}"
 CONTAINER_PORT="${CONTAINER_PORT:-8000}"
@@ -50,22 +55,20 @@ TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-4}"
 
 DTYPE="${DTYPE:-float16}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.85}"
-# The model card states 128K context length, but default to 32K first to keep
-# startup pressure lower. Raise it via environment override if needed.
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-40960}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}"
 
-# Goose and similar OpenAI-compatible agents typically send tool_choice=auto
-# once tools are present. vLLM requires both auto-tool-choice and a parser to
-# be enabled server-side for that path to work. Command-R does not currently
-# have a dedicated vLLM parser. Its official tool-use format is a JSON action
-# list rendered via the Hugging Face tool-use API / tool_use chat template, so
-# default to xLAM's generic JSON-array parser first and keep everything
-# overrideable via environment variables.
-TOOL_CALL_PARSER="${TOOL_CALL_PARSER:-xlam}"
-REASONING_PARSER="${REASONING_PARSER:-}"
+# vLLM 官方 Qwen tool calling 建议：
+#   --tool-call-parser hermes
+# Goose 这类客户端通常会发送 tool_choice=auto，因此默认启用 auto tool choice。
+TOOL_CALL_PARSER="${TOOL_CALL_PARSER:-hermes}"
 ENABLE_AUTO_TOOL_CHOICE="${ENABLE_AUTO_TOOL_CHOICE:-1}"
-LANGUAGE_MODEL_ONLY="${LANGUAGE_MODEL_ONLY:-1}"
+LANGUAGE_MODEL_ONLY="${LANGUAGE_MODEL_ONLY:-0}"
+# Qwen3-32B 的 thinking 切换主要发生在请求侧，而不是 serve CLI。
+# 这里保留一个显式变量，便于测试时统一记录当前预期模式：
+#   think      -> 期望客户端请求时显式附加 /think
+#   no_think   -> 期望客户端请求时显式附加 /no_think
+THINKING_MODE="${THINKING_MODE:-think}"
 CHAT_TEMPLATE="${CHAT_TEMPLATE:-}"
 TRUST_REMOTE_CODE="${TRUST_REMOTE_CODE:-0}"
 DISABLE_CUSTOM_ALL_REDUCE="${DISABLE_CUSTOM_ALL_REDUCE:-1}"
@@ -129,9 +132,9 @@ Current defaults:
   MAX_MODEL_LEN=${MAX_MODEL_LEN}
   MAX_NUM_SEQS=${MAX_NUM_SEQS}
   TOOL_CALL_PARSER=${TOOL_CALL_PARSER}
-  REASONING_PARSER=${REASONING_PARSER}
   ENABLE_AUTO_TOOL_CHOICE=${ENABLE_AUTO_TOOL_CHOICE}
   LANGUAGE_MODEL_ONLY=${LANGUAGE_MODEL_ONLY}
+  THINKING_MODE=${THINKING_MODE}
   CHAT_TEMPLATE=${CHAT_TEMPLATE}
   TRUST_REMOTE_CODE=${TRUST_REMOTE_CODE}
   DISABLE_CUSTOM_ALL_REDUCE=${DISABLE_CUSTOM_ALL_REDUCE}
@@ -267,18 +270,12 @@ resolve_model_dir() {
 }
 
 #######################################
-# Snapshot / Validation
+# Diagnostics
 #######################################
-save_env_snapshot() {
-  local file="${LOG_DIR}/env_snapshot.txt"
+dump_env_snapshot() {
+  resolve_model_dir
+  local outfile="${LOG_DIR}/env_snapshot.txt"
   {
-    echo "timestamp=$(ts)"
-    echo "run_ts=${RUN_TS}"
-    echo "script_name=${SCRIPT_NAME}"
-    echo "script_version=${SCRIPT_VERSION}"
-    echo "base_dir=${BASE_DIR}"
-    echo "log_dir=${LOG_DIR}"
-    echo "run_log=${RUN_LOG}"
     echo "pwd=$(pwd)"
     echo "user=$(whoami 2>/dev/null || true)"
     echo "hostname=$(hostname 2>/dev/null || true)"
@@ -298,9 +295,9 @@ save_env_snapshot() {
     echo "max_model_len=${MAX_MODEL_LEN}"
     echo "max_num_seqs=${MAX_NUM_SEQS}"
     echo "tool_call_parser=${TOOL_CALL_PARSER}"
-    echo "reasoning_parser=${REASONING_PARSER}"
     echo "enable_auto_tool_choice=${ENABLE_AUTO_TOOL_CHOICE}"
     echo "language_model_only=${LANGUAGE_MODEL_ONLY}"
+    echo "thinking_mode=${THINKING_MODE}"
     echo "chat_template=${CHAT_TEMPLATE}"
     echo "trust_remote_code=${TRUST_REMOTE_CODE}"
     echo "disable_custom_all_reduce=${DISABLE_CUSTOM_ALL_REDUCE}"
@@ -311,110 +308,45 @@ save_env_snapshot() {
     echo
     echo "### /etc/os-release ###"
     cat /etc/os-release || true
-    echo
-    echo "### docker version ###"
-    ${DOCKER_BIN} version || true
-    echo
-    echo "### docker info ###"
-    ${DOCKER_BIN} info || true
-    echo
-    echo "### nvidia-smi ###"
-    nvidia-smi || true
-    echo
-    echo "### df -h ###"
-    df -h || true
-    echo
-    echo "### free -h ###"
-    free -h || true
-  } >"${file}" 2>&1 || true
-  log "Environment snapshot saved: ${file}"
+  } >"${outfile}" 2>&1 || true
 }
 
-check_paths() {
+#######################################
+# Validation
+#######################################
+validate_env() {
   resolve_model_dir
+  divider
+  log "Validating runtime environment"
+
+  require_bin "${DOCKER_BIN}"
+  require_bin "${CURL_BIN}"
 
   [[ -d "${MODELS_ROOT}" ]] || { err "Models root not found: ${MODELS_ROOT}"; return 1; }
-  [[ -d "${HF_CACHE}" ]] || { err "HF cache dir not found: ${HF_CACHE}"; return 1; }
   [[ -d "${MODEL_DIR}" ]] || { err "Model dir not found: ${MODEL_DIR}"; return 1; }
   [[ -d "${MODEL_DIR_REAL}" ]] || { err "Resolved model dir not found: ${MODEL_DIR_REAL}"; return 1; }
 
+  case "${THINKING_MODE}" in
+    think|no_think) ;;
+    *)
+      err "Invalid THINKING_MODE: ${THINKING_MODE}. Expected: think | no_think"
+      return 1
+      ;;
+  esac
+
   if [[ ! -f "${MODEL_DIR_REAL}/config.json" && ! -f "${MODEL_DIR_REAL}/params.json" ]]; then
     err "MODEL_DIR does not look like a valid model root: ${MODEL_DIR_REAL}"
-    err "Expected config.json (HF) or params.json (Mistral-style)"
     return 1
   fi
 
-  log "Path check passed"
+  mkdir -p "${HF_CACHE}"
+
+  log "Validation passed:"
   log "  MODELS_ROOT = ${MODELS_ROOT}"
-  log "  HF_CACHE    = ${HF_CACHE}"
   log "  MODEL_DIR   = ${MODEL_DIR}"
   log "  MODEL_DIR_REAL = ${MODEL_DIR_REAL}"
-  if [[ -n "${MODEL_EXTRA_MOUNT}" ]]; then
-    log "  MODEL_EXTRA_MOUNT enabled for resolved symlink target"
-  fi
-}
-
-validate_image() {
-  if ${DOCKER_BIN} image inspect "${IMAGE}" >/dev/null 2>&1; then
-    log "Docker image exists locally: ${IMAGE}"
-  else
-    warn "Docker image not found locally: ${IMAGE}"
-    warn "You may need: docker pull ${IMAGE}"
-  fi
-}
-
-validate_ports() {
-  divider
-  log "Checking port usage"
-
-  if is_port_listening "${HOST_PORT}"; then
-    warn "Port ${HOST_PORT} is already listening"
-    port_check "${HOST_PORT}" | tee -a "${RUN_LOG}" || true
-  else
-    log "Port ${HOST_PORT} is free"
-  fi
-}
-
-validate_gpu() {
-  divider
-  log "Checking GPU visibility"
-  if command -v nvidia-smi >/dev/null 2>&1; then
-    nvidia-smi 2>&1 | tee -a "${RUN_LOG}" >/dev/null || true
-    nvidia-smi -L 2>&1 | tee -a "${RUN_LOG}" || true
-  else
-    warn "nvidia-smi not found"
-  fi
-}
-
-validate_runtime() {
-  divider
-  log "Checking Docker runtime"
-  ${DOCKER_BIN} version 2>&1 | tee -a "${RUN_LOG}" >/dev/null || {
-    err "docker version failed"
-    return 1
-  }
-  ${DOCKER_BIN} info 2>&1 | tee -a "${RUN_LOG}" >/dev/null || {
-    err "docker info failed"
-    return 1
-  }
-  log "Docker runtime check passed"
-}
-
-validate_all() {
-  require_bin "${DOCKER_BIN}"
-  require_bin "${CURL_BIN}"
-  resolve_model_dir
-
-  divider
-  log "Validate start"
-  save_env_snapshot
-  validate_runtime
-  validate_gpu
-  check_paths
-  validate_image
-  validate_ports
-  divider
-  log "Validate finished"
+  log "  HF_CACHE    = ${HF_CACHE}"
+  log "  HOST_PORT   = ${HOST_PORT}"
 }
 
 #######################################
@@ -458,10 +390,6 @@ build_run_cmd() {
 
   if [[ -n "${TOOL_CALL_PARSER}" ]]; then
     cmd+=(--tool-call-parser "${TOOL_CALL_PARSER}")
-  fi
-
-  if [[ -n "${REASONING_PARSER}" ]]; then
-    cmd+=(--reasoning-parser "${REASONING_PARSER}")
   fi
 
   if [[ "${ENABLE_AUTO_TOOL_CHOICE}" == "1" ]]; then
@@ -510,166 +438,41 @@ probe_health_endpoint() {
     "http://127.0.0.1:${HOST_PORT}/health"
 }
 
-probe_ping_endpoint() {
-  ${CURL_BIN} -fsS \
-    --connect-timeout "${HEALTH_CONNECT_TIMEOUT}" \
-    --max-time "${HEALTH_MAX_TIME}" \
-    "http://127.0.0.1:${HOST_PORT}/ping"
-}
-
-status_probe_result() {
-  local label="$1"
-  shift
-  if "$@" >/dev/null 2>&1; then
-    printf '%-8s: READY\n' "${label}"
-  else
-    printf '%-8s: FAIL\n' "${label}"
+container_seems_healthy() {
+  if probe_health_endpoint >/dev/null 2>&1; then
+    return 0
   fi
-}
-
-container_logs_show_ready_markers() {
-  ${DOCKER_BIN} logs --tail 200 "${CONTAINER_NAME}" 2>&1 | grep -Eq \
-    'Application startup complete|Starting vLLM API server|Route: /v1/models'
-}
-
-health_check() {
-  local retries="${1:-${HEALTH_RETRIES}}"
-  local interval="${2:-${HEALTH_INTERVAL}}"
-  local out_file="${LOG_DIR}/healthcheck.txt"
-  local status=""
-  local rc=0
-  local api_rc=0
-  local health_rc=0
-  local ping_rc=0
-  local log_ready=no
-
-  log "Checking health for ${CONTAINER_NAME} on port ${HOST_PORT} (timeout=$((retries * interval))s)"
-
-  {
-    echo "### HEALTHCHECK_TIMESTAMP ###"
-    echo "$(ts)"
-    echo "### TARGET ###"
-    echo "http://127.0.0.1:${HOST_PORT}/v1/models"
-    echo "### SETTINGS ###"
-    echo "retries=${retries}"
-    echo "interval=${interval}"
-    echo "connect_timeout=${HEALTH_CONNECT_TIMEOUT}"
-    echo "max_time=${HEALTH_MAX_TIME}"
-    echo
-  } > "${out_file}"
-
-  local i
-  for ((i=1; i<=retries; i++)); do
-    status="$(${DOCKER_BIN} inspect --format '{{.State.Status}}' "${CONTAINER_NAME}" 2>/dev/null || echo unknown)"
-    if [[ "${status}" != "running" ]]; then
-      err "${CONTAINER_NAME} is not running during health check (status=${status})"
-      collect_failure_context "container_not_running_during_healthcheck"
-      return 1
-    fi
-
-    {
-      echo "attempt=${i} timestamp=$(ts)"
-      echo "container_status=${status}"
-      api_rc=0
-      health_rc=0
-      ping_rc=0
-      log_ready=no
-
-      if probe_api >/dev/null; then
-        api_rc=0
-      else
-        api_rc=$?
-      fi
-
-      if probe_health_endpoint >/dev/null; then
-        health_rc=0
-      else
-        health_rc=$?
-      fi
-
-      if probe_ping_endpoint >/dev/null; then
-        ping_rc=0
-      else
-        ping_rc=$?
-      fi
-
-      if container_logs_show_ready_markers; then
-        log_ready=yes
-      fi
-
-      if [[ "${api_rc}" -eq 0 || "${health_rc}" -eq 0 || "${ping_rc}" -eq 0 ]]; then
-        rc=0
-      else
-        rc=1
-      fi
-
-      echo "api_exit_code=${api_rc}"
-      echo "health_exit_code=${health_rc}"
-      echo "ping_exit_code=${ping_rc}"
-      echo "log_ready_markers=${log_ready}"
-      echo
-      echo "exit_code=${rc}"
-      echo "----------------------------------------"
-    } >> "${out_file}" 2>&1 || true
-
-    if (( i % 10 == 0 )); then
-      log "Health check still waiting: attempt=${i}/${retries}, container_status=${status}, api=${api_rc}, health=${health_rc}, ping=${ping_rc}, log_ready=${log_ready}"
-    fi
-
-    if [[ "${rc}" -eq 0 ]]; then
-      log "${CONTAINER_NAME} is ready"
-      return 0
-    fi
-
-    sleep "${interval}"
-  done
-
-  err "${CONTAINER_NAME} health check failed after ${retries} attempts"
-  collect_failure_context "health_check_timeout"
+  if probe_api >/dev/null 2>&1; then
+    return 0
+  fi
   return 1
 }
 
-#######################################
-# Failure Context + Summary
-#######################################
 collect_failure_context() {
   local failure_reason="${1:-unknown}"
   local outdir="${LOG_DIR}/failure_${CONTAINER_NAME}"
+  local cmd_file="${LOG_DIR}/start_command.txt"
   mkdir -p "${outdir}"
 
   warn "Collecting failure context for ${CONTAINER_NAME} into ${outdir}"
-
-  capture_cmd "${outdir}/docker_ps.txt" ${DOCKER_BIN} ps -a
-  capture_cmd "${outdir}/docker_ps_current.txt" ${DOCKER_BIN} ps
+  capture_cmd "${outdir}/docker_ps_a.txt" ${DOCKER_BIN} ps -a
+  capture_cmd "${outdir}/docker_ps.txt" ${DOCKER_BIN} ps
   capture_cmd "${outdir}/docker_inspect.txt" ${DOCKER_BIN} inspect "${CONTAINER_NAME}"
   capture_cmd "${outdir}/docker_inspect_state.txt" ${DOCKER_BIN} inspect --format '{{.State.Status}} restart_count={{.RestartCount}} exit_code={{.State.ExitCode}} oom_killed={{.State.OOMKilled}} error={{.State.Error}}' "${CONTAINER_NAME}"
   capture_cmd "${outdir}/docker_inspect_devices.txt" ${DOCKER_BIN} inspect --format '{{json .HostConfig.DeviceRequests}}' "${CONTAINER_NAME}"
   capture_cmd "${outdir}/docker_logs_tail_200.txt" ${DOCKER_BIN} logs --timestamps --tail 200 "${CONTAINER_NAME}"
   capture_cmd "${outdir}/docker_logs_tail_500.txt" ${DOCKER_BIN} logs --timestamps --tail 500 "${CONTAINER_NAME}"
-  capture_cmd "${outdir}/port_check.txt" bash -lc "$(declare -f port_check); port_check ${HOST_PORT}"
-  capture_cmd "${outdir}/curl_models.txt" ${CURL_BIN} -sS "http://127.0.0.1:${HOST_PORT}/v1/models" -H "Authorization: Bearer ${API_KEY}"
-  capture_cmd "${outdir}/nvidia_smi.txt" nvidia-smi
-  capture_cmd "${outdir}/df_h.txt" df -h
-  capture_cmd "${outdir}/free_h.txt" free -h
-  capture_cmd "${outdir}/models_root_ls.txt" ls -lah "${MODELS_ROOT}"
+  capture_cmd "${outdir}/docker_images.txt" ${DOCKER_BIN} images
+  capture_cmd "${outdir}/port_check.txt" port_check "${HOST_PORT}"
+  capture_cmd "${outdir}/ss_port.txt" bash -lc "command -v ss >/dev/null 2>&1 && ss -lntp | grep -E '[:.]${HOST_PORT}( |$)' || true"
+  capture_cmd "${outdir}/nvidia_smi.txt" bash -lc "command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi || true"
+  capture_cmd "${outdir}/nvidia_smi_pmon.txt" bash -lc "command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi pmon -c 1 || true"
   capture_cmd "${outdir}/model_dir_ls.txt" ls -lah "${MODEL_DIR}"
+  capture_cmd "${outdir}/model_dir_real_ls.txt" ls -lah "${MODEL_DIR_REAL}"
   capture_cmd "${outdir}/hf_cache_ls.txt" ls -lah "${HF_CACHE}"
-  capture_cmd "${outdir}/docker_info.txt" ${DOCKER_BIN} info
-  capture_cmd "${outdir}/docker_version.txt" ${DOCKER_BIN} version
 
-  local cmd_file="${outdir}/start_command.txt"
-  build_run_cmd > "${cmd_file}"
-  chmod +x "${cmd_file}" || true
-
-  tail -n 200 "${RUN_LOG}" > "${outdir}/script_log_tail_200.txt" 2>/dev/null || true
-
-  local summary_file="${outdir}/error_summary.txt"
   {
-    echo "==================== META ===================="
-    echo "summary_generated_at=$(ts)"
-    echo "run_ts=${RUN_TS}"
-    echo "run_log=${RUN_LOG}"
-    echo "base_dir=${BASE_DIR}"
+    echo "failure_timestamp=$(ts)"
     echo "script_path=${BASE_DIR}/${SCRIPT_NAME}"
     echo "script_version=${SCRIPT_VERSION}"
     echo "failure_reason=${failure_reason}"
@@ -689,9 +492,9 @@ collect_failure_context() {
     echo "max_model_len=${MAX_MODEL_LEN}"
     echo "max_num_seqs=${MAX_NUM_SEQS}"
     echo "tool_call_parser=${TOOL_CALL_PARSER}"
-    echo "reasoning_parser=${REASONING_PARSER}"
     echo "enable_auto_tool_choice=${ENABLE_AUTO_TOOL_CHOICE}"
     echo "language_model_only=${LANGUAGE_MODEL_ONLY}"
+    echo "thinking_mode=${THINKING_MODE}"
     echo "chat_template=${CHAT_TEMPLATE}"
     echo "trust_remote_code=${TRUST_REMOTE_CODE}"
     echo "disable_custom_all_reduce=${DISABLE_CUSTOM_ALL_REDUCE}"
@@ -702,161 +505,94 @@ collect_failure_context() {
     echo "==================== start_command.txt ===================="
     cat "${cmd_file}" 2>/dev/null || true
     echo
+  } >"${outdir}/summary.txt"
 
-    echo "==================== script_log_tail_200.txt ===================="
-    cat "${outdir}/script_log_tail_200.txt" 2>/dev/null || true
-    echo
-
-    echo "==================== docker_logs_tail_200.txt ===================="
-    cat "${outdir}/docker_logs_tail_200.txt" 2>/dev/null || true
-    echo
-
-    echo "==================== docker_inspect_state.txt ===================="
-    cat "${outdir}/docker_inspect_state.txt" 2>/dev/null || true
-    echo
-
-    echo "==================== docker_inspect_devices.txt ===================="
-    cat "${outdir}/docker_inspect_devices.txt" 2>/dev/null || true
-    echo
-
-    echo "==================== docker_inspect.txt ===================="
-    cat "${outdir}/docker_inspect.txt" 2>/dev/null || true
-    echo
-
-    echo "==================== docker_ps.txt ===================="
-    cat "${outdir}/docker_ps.txt" 2>/dev/null || true
-    echo
-
-    echo "==================== curl_models.txt ===================="
-    cat "${outdir}/curl_models.txt" 2>/dev/null || true
-    echo
-
-    echo "==================== healthcheck.txt ===================="
-    cat "${LOG_DIR}/healthcheck.txt" 2>/dev/null || true
-    echo
-
-    echo "==================== port_check.txt ===================="
-    cat "${outdir}/port_check.txt" 2>/dev/null || true
-    echo
-
-    echo "==================== nvidia_smi.txt ===================="
-    cat "${outdir}/nvidia_smi.txt" 2>/dev/null || true
-    echo
-
-    echo "==================== df_h.txt ===================="
-    cat "${outdir}/df_h.txt" 2>/dev/null || true
-    echo
-
-    echo "==================== free_h.txt ===================="
-    cat "${outdir}/free_h.txt" 2>/dev/null || true
-    echo
-
-    echo "==================== models_root_ls.txt ===================="
-    cat "${outdir}/models_root_ls.txt" 2>/dev/null || true
-    echo
-
-    echo "==================== model_dir_ls.txt ===================="
-    cat "${outdir}/model_dir_ls.txt" 2>/dev/null || true
-    echo
-
-    echo "==================== hf_cache_ls.txt ===================="
-    cat "${outdir}/hf_cache_ls.txt" 2>/dev/null || true
-    echo
-
-    echo "==================== docker_info.txt ===================="
-    cat "${outdir}/docker_info.txt" 2>/dev/null || true
-    echo
-
-    echo "==================== docker_version.txt ===================="
-    cat "${outdir}/docker_version.txt" 2>/dev/null || true
-    echo
-  } > "${summary_file}"
-
-  warn "Failure context collected: ${outdir}"
-  warn "Failure summary generated: ${summary_file}"
-  warn "Send this file for analysis: ${summary_file}"
+  warn "Failure context ready: ${outdir}"
 }
 
-#######################################
-# Debug Bundle
-#######################################
+health_check() {
+  local retries="${HEALTH_RETRIES}"
+  local interval="${HEALTH_INTERVAL}"
+  local attempt=1
+
+  log "Checking health for ${CONTAINER_NAME} on port ${HOST_PORT} (timeout=$((retries * interval))s)"
+  while (( attempt <= retries )); do
+    if container_seems_healthy; then
+      log "${CONTAINER_NAME} is ready"
+      return 0
+    fi
+
+    local status
+    status="$(${DOCKER_BIN} inspect --format '{{.State.Status}}' "${CONTAINER_NAME}" 2>/dev/null || echo unknown)"
+    if [[ "${status}" != "running" ]]; then
+      err "${CONTAINER_NAME} is not running during health check (status=${status})"
+      collect_failure_context "container_not_running"
+      return 1
+    fi
+
+    if (( attempt % 10 == 0 )); then
+      log "Health check attempt ${attempt}/${retries} not ready yet"
+    fi
+    sleep "${interval}"
+    attempt=$((attempt + 1))
+  done
+
+  err "${CONTAINER_NAME} health check failed after ${retries} attempts"
+  collect_failure_context "health_timeout"
+  return 1
+}
+
 debug_service() {
+  resolve_model_dir
   local outdir="${LOG_DIR}/debug_${CONTAINER_NAME}"
   mkdir -p "${outdir}"
-
-  log "Collecting debug bundle -> ${outdir}"
-
-  capture_cmd "${outdir}/docker_ps_a.txt" ${DOCKER_BIN} ps -a
-  capture_cmd "${outdir}/docker_ps.txt" ${DOCKER_BIN} ps
+  log "Collecting debug context into ${outdir}"
+  capture_cmd "${outdir}/docker_ps.txt" ${DOCKER_BIN} ps -a
   capture_cmd "${outdir}/docker_inspect.txt" ${DOCKER_BIN} inspect "${CONTAINER_NAME}"
   capture_cmd "${outdir}/docker_inspect_state.txt" ${DOCKER_BIN} inspect --format '{{.State.Status}} restart_count={{.RestartCount}} exit_code={{.State.ExitCode}} oom_killed={{.State.OOMKilled}} error={{.State.Error}}' "${CONTAINER_NAME}"
   capture_cmd "${outdir}/docker_logs_tail_200.txt" ${DOCKER_BIN} logs --timestamps --tail 200 "${CONTAINER_NAME}"
   capture_cmd "${outdir}/docker_logs_tail_500.txt" ${DOCKER_BIN} logs --timestamps --tail 500 "${CONTAINER_NAME}"
-  capture_cmd "${outdir}/port_check.txt" bash -lc "$(declare -f port_check); port_check ${HOST_PORT}"
-  capture_cmd "${outdir}/curl_models.txt" ${CURL_BIN} -sS "http://127.0.0.1:${HOST_PORT}/v1/models" -H "Authorization: Bearer ${API_KEY}"
-  capture_cmd "${outdir}/nvidia_smi.txt" nvidia-smi
-  capture_cmd "${outdir}/df_h.txt" df -h
-  capture_cmd "${outdir}/free_h.txt" free -h
-  capture_cmd "${outdir}/models_root_ls.txt" ls -lah "${MODELS_ROOT}"
+  capture_cmd "${outdir}/nvidia_smi.txt" bash -lc "command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi || true"
+  capture_cmd "${outdir}/port_check.txt" port_check "${HOST_PORT}"
   capture_cmd "${outdir}/model_dir_ls.txt" ls -lah "${MODEL_DIR}"
-  capture_cmd "${outdir}/hf_cache_ls.txt" ls -lah "${HF_CACHE}"
-  capture_cmd "${outdir}/docker_info.txt" ${DOCKER_BIN} info
-  capture_cmd "${outdir}/docker_version.txt" ${DOCKER_BIN} version
 
-  local summary_file="${outdir}/debug_summary.txt"
   {
-    echo "==================== META ===================="
-    echo "summary_generated_at=$(ts)"
-    echo "run_ts=${RUN_TS}"
-    echo "run_log=${RUN_LOG}"
     echo "container_name=${CONTAINER_NAME}"
     echo "model_dir=${MODEL_DIR}"
     echo "model_name=${MODEL_NAME}"
-    echo
+    echo "host_port=${HOST_PORT}"
+    echo "gpu_devices=${GPU_DEVICES}"
+  } >"${outdir}/summary.txt"
 
-    echo "==================== docker_logs_tail_200.txt ===================="
-    cat "${outdir}/docker_logs_tail_200.txt" 2>/dev/null || true
-    echo
-
-    echo "==================== docker_inspect_state.txt ===================="
-    cat "${outdir}/docker_inspect_state.txt" 2>/dev/null || true
-    echo
-
-    echo "==================== docker_inspect.txt ===================="
-    cat "${outdir}/docker_inspect.txt" 2>/dev/null || true
-    echo
-
-    echo "==================== curl_models.txt ===================="
-    cat "${outdir}/curl_models.txt" 2>/dev/null || true
-    echo
-
-    echo "==================== nvidia_smi.txt ===================="
-    cat "${outdir}/nvidia_smi.txt" 2>/dev/null || true
-    echo
-  } > "${summary_file}"
-
-  log "Debug bundle created: ${outdir}"
-  log "Debug summary created: ${summary_file}"
+  log "Debug bundle written to ${outdir}"
 }
 
 #######################################
-# Start / Stop / Restart
+# Lifecycle
 #######################################
 start_service() {
   divider
-  log "Starting container: ${CONTAINER_NAME}"
+  log "Script start: ${SCRIPT_NAME} startup"
+  log "Run log file: ${RUN_LOG}"
+  log "Run directory: ${LOG_DIR}"
+
+  dump_env_snapshot
+  validate_env
+
+  if is_port_listening "${HOST_PORT}"; then
+    warn "Host port ${HOST_PORT} already appears to be listening"
+    port_check "${HOST_PORT}" | tee -a "${RUN_LOG}" || true
+  fi
+
   remove_container_if_exists
 
-  local cmd_file="${LOG_DIR}/start_command.sh"
-  build_run_cmd > "${cmd_file}"
-  chmod +x "${cmd_file}" || true
+  local cmd_str
+  cmd_str="$(build_run_cmd)"
+  echo "${cmd_str}" >"${LOG_DIR}/start_command.txt"
 
-  log "Docker command saved: ${cmd_file}"
-  log "Docker command:"
-  cat "${cmd_file}" | tee -a "${RUN_LOG}"
-
-  if ! bash "${cmd_file}" 2>&1 | tee -a "${RUN_LOG}"; then
-    err "Docker run failed"
+  log "Starting container: ${CONTAINER_NAME}"
+  if ! bash -lc "${cmd_str}" >>"${RUN_LOG}" 2>&1; then
+    err "docker run failed"
     collect_failure_context "docker_run_failed"
     return 1
   fi
@@ -900,10 +636,10 @@ status_service() {
   echo "MODEL_NAME     : ${MODEL_NAME}" | tee -a "${RUN_LOG}"
   echo "MAX_NUM_SEQS   : ${MAX_NUM_SEQS}" | tee -a "${RUN_LOG}"
   echo "TOOL_CALL_PARSER : ${TOOL_CALL_PARSER}" | tee -a "${RUN_LOG}"
-  echo "REASONING_PARSER : ${REASONING_PARSER}" | tee -a "${RUN_LOG}"
   echo "ENABLE_AUTO_TOOL_CHOICE : ${ENABLE_AUTO_TOOL_CHOICE}" | tee -a "${RUN_LOG}"
   echo "CHAT_TEMPLATE : ${CHAT_TEMPLATE}" | tee -a "${RUN_LOG}"
   echo "LANGUAGE_MODEL_ONLY : ${LANGUAGE_MODEL_ONLY}" | tee -a "${RUN_LOG}"
+  echo "THINKING_MODE : ${THINKING_MODE}" | tee -a "${RUN_LOG}"
   echo "TRUST_REMOTE_CODE : ${TRUST_REMOTE_CODE}" | tee -a "${RUN_LOG}"
   echo "DISABLE_CUSTOM_ALL_REDUCE : ${DISABLE_CUSTOM_ALL_REDUCE}" | tee -a "${RUN_LOG}"
   echo "ENFORCE_EAGER : ${ENFORCE_EAGER}" | tee -a "${RUN_LOG}"
@@ -916,76 +652,61 @@ status_service() {
 
   echo | tee -a "${RUN_LOG}"
   divider
-  echo "Probe Status" | tee -a "${RUN_LOG}"
+  echo "Health Probe" | tee -a "${RUN_LOG}"
   divider
-  if container_running; then
-    status_probe_result "models" probe_api | tee -a "${RUN_LOG}"
-    status_probe_result "health" probe_health_endpoint | tee -a "${RUN_LOG}"
-    status_probe_result "ping" probe_ping_endpoint | tee -a "${RUN_LOG}"
-    if probe_api >/dev/null 2>&1 || probe_health_endpoint >/dev/null 2>&1 || probe_ping_endpoint >/dev/null 2>&1; then
-      echo "CONTROL  : READY   (http://127.0.0.1:${HOST_PORT})" | tee -a "${RUN_LOG}"
-    else
-      echo "CONTROL  : NOT READY / STARTING (http://127.0.0.1:${HOST_PORT})" | tee -a "${RUN_LOG}"
-    fi
-    echo "INFER    : NOT VERIFIED (status only checks endpoints, not generation)" | tee -a "${RUN_LOG}"
+  if container_seems_healthy; then
+    echo "READY" | tee -a "${RUN_LOG}"
   else
-    echo "CONTROL  : STOPPED" | tee -a "${RUN_LOG}"
-    echo "INFER    : NOT VERIFIED" | tee -a "${RUN_LOG}"
+    echo "NOT_READY" | tee -a "${RUN_LOG}"
   fi
-
-  echo | tee -a "${RUN_LOG}"
-  divider
-  echo "Port Listening" | tee -a "${RUN_LOG}"
-  divider
-  port_check "${HOST_PORT}" | tee -a "${RUN_LOG}" || true
-
-  echo | tee -a "${RUN_LOG}"
-  divider
-  echo "GPU Status" | tee -a "${RUN_LOG}"
-  divider
-  nvidia-smi 2>&1 | tee -a "${RUN_LOG}" || true
 }
 
 #######################################
 # Main
 #######################################
 main() {
-  require_bin "${DOCKER_BIN}"
-  require_bin "${CURL_BIN}"
-
-  local cmd="${1:-}"
-
-  log "Script start: ${SCRIPT_NAME} ${*:-}"
-  log "Run log file: ${RUN_LOG}"
-  log "Run directory: ${LOG_DIR}"
-
-  case "${cmd}" in
+  local action="${1:-}"
+  case "${action}" in
     validate)
-      validate_all
+      log "Script start: ${SCRIPT_NAME} validate"
+      log "Run log file: ${RUN_LOG}"
+      log "Run directory: ${LOG_DIR}"
+      dump_env_snapshot
+      validate_env
       ;;
     startup)
-      validate_all
       start_service
       ;;
     stop)
+      log "Script start: ${SCRIPT_NAME} stop"
+      log "Run log file: ${RUN_LOG}"
+      log "Run directory: ${LOG_DIR}"
       stop_service
       ;;
     restart)
-      validate_all
       restart_service
       ;;
     status)
+      log "Script start: ${SCRIPT_NAME} status"
+      log "Run log file: ${RUN_LOG}"
+      log "Run directory: ${LOG_DIR}"
       status_service
       ;;
     logs)
+      log "Script start: ${SCRIPT_NAME} logs"
+      log "Run log file: ${RUN_LOG}"
+      log "Run directory: ${LOG_DIR}"
       logs_service
       ;;
     debug)
+      log "Script start: ${SCRIPT_NAME} debug"
+      log "Run log file: ${RUN_LOG}"
+      log "Run directory: ${LOG_DIR}"
       debug_service
       ;;
     *)
       usage
-      exit 1
+      [[ -n "${action}" ]] && exit 1
       ;;
   esac
 }
