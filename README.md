@@ -2,6 +2,10 @@
 
 用于启动 vLLM 模型服务，并通过 OpenAI 兼容接口对模型服务做长上下文基准测试。
 
+## Repository
+
+- GitHub: [buyangnie/model-service-ctl](https://github.com/buyangnie/model-service-ctl)
+
 ## Files
 
 - [`bench_model_service.py`](/Users/buyangnie/Documents/GitHub/model-service-ctl/bench_model_service.py)
