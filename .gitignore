@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+logs/
+
+model_service_benchmark_report_*.md
+report_*.md
+
+.DS_Store

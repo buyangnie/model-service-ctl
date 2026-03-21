@@ -1,0 +1,534 @@
+{
+  "version": "1",
+  "name": "model_service_testset",
+  "description": "单条长 ReAct agent trace 测试集。通过 20 次工具调用逐步累积上下文，用于观察 4k/8k/16k/32k 输入规模下的 OpenAI-compatible chat/completions 流式性能变化。",
+  "design_goals": [
+    "模拟真实 agentic 场景中的多轮历史累积，而不是单轮长 prompt。",
+    "每次工具调用后都追加 assistant tool call 和 tool result，历史上下文持续增长。",
+    "工具结果尽量贴近运维现场，包括 runbook、监控摘要、变更记录、工单评论、知识库检索、配置差异、事件时间线和集群事件。",
+    "最终输出不做严格要求，重点观察长输入下的 TTFT、总耗时、GPU 使用率和缓存相关指标。"
+  ],
+  "agent_trace_case": {
+    "name": "react_ops_investigation_20_tools",
+    "category": "react_agent_trace",
+    "description": "一次围绕检索链路抖动的长 ReAct 运维调查。代理连续调用 20 次工具，历史逐步累积，最终只要求极短输出。bench 侧可按 amplify 配置进一步放大每个 tool result，以逼近 16k/32k 输入。",
+    "amplify": {
+      "enabled": true,
+      "repeat_each_tool_result": 6,
+      "separator": "\n\n[同类历史补充片段]\n"
+    },
+    "milestones": [
+      {
+        "name": "step_3",
+        "tool_calls_included": 3,
+        "goal": "通常会落在较小上下文区间，用于对照基线。"
+      },
+      {
+        "name": "step_5",
+        "tool_calls_included": 5,
+        "goal": "观察上下文进入数千 token 时的变化。"
+      },
+      {
+        "name": "step_8",
+        "tool_calls_included": 8,
+        "goal": "通常会接近中等长度上下文。"
+      },
+      {
+        "name": "step_10",
+        "tool_calls_included": 10,
+        "goal": "观察 agent 历史在较长上下文下的 TTFT。"
+      },
+      {
+        "name": "step_12",
+        "tool_calls_included": 12,
+        "goal": "继续逼近大上下文区间。"
+      },
+      {
+        "name": "step_15",
+        "tool_calls_included": 15,
+        "goal": "通常会接近或跨过 16k 输入区间。"
+      },
+      {
+        "name": "step_18",
+        "tool_calls_included": 18,
+        "goal": "进一步逼近超长上下文。"
+      },
+      {
+        "name": "step_20",
+        "tool_calls_included": 20,
+        "goal": "完整 20 次工具调用历史，用于观察 32k 附近或以上输入时的表现。"
+      }
+    ],
+    "final_user_prompts": [
+      "请只输出 OK。",
+      "请只输出 OK。",
+      "请只输出 OK。"
+    ],
+    "messages": [
+      {
+        "role": "system",
+        "content": "你是一个负责线上稳定性的运维代理。你需要基于已有的工具调用历史继续调查问题。注意：本测试主要用于观察长上下文性能，最终输出可以很短，但必须基于已有历史。"
+      },
+      {
+        "role": "user",
+        "content": "问题背景：检索链路在大促压测期间出现延迟抖动和局部召回空结果。请你像一个 ReAct 运维代理一样逐步调查，优先检查运行手册、最近变更、监控、日志、配置、工单和集群事件，再决定下一步。"
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "id": "call_01",
+            "type": "function",
+            "function": {
+              "name": "search_runbook",
+              "arguments": "{\"query\":\"检索链路延迟抖动 召回空结果 排查流程\"}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "call_01",
+        "content": "运行手册检索结果：\n【文档 1：检索链路延迟抖动排查总则】\n1. 先判断问题是否影响核心搜索、推荐或问答主链路，如果影响核心流量且跨多个可用区，需要同步升级值班等级。\n2. 检查最近 60 分钟内是否发生模型切换、召回策略调整、缓存 key 结构变更、索引版本更新或特征字典替换。\n3. 如果用户表现为“空结果增多”，不能只看平均 RT，必须同时查看召回命中率、重排前候选数、下游超时和降级开关命中情况。\n4. 若最近发生过配置热更新，应优先核查热更新是否伴随 schema 变化、特征缺失、字段兼容性问题或 key 命名差异。\n5. 若监控显示 P95 RT 抖动但 GPU 使用率不高，要进一步排查缓存命中、向量索引预热、网络抖动和线程池排队，而不是直接归因为算力不足。\n6. 若存在“召回空结果 + 延迟上升”组合现象，经验上常见于：索引版本落后、查询改写异常、缓存污染、召回超时后误走空结果分支、重排前过滤规则过严。\n7. 在未完成版本和配置核验前，不建议直接扩容，因为扩容会掩盖真实根因，并且可能放大缓存不一致问题。\n8. 排查顺序建议为：最近变更 -> 监控摘要 -> 关键错误日志 -> 配置差异 -> 工单与用户反馈 -> 集群事件 -> 最终动作。\n【文档 2：召回空结果专项】\n1. 重点看 query_rewrite_success_rate、recall_candidate_count、rerank_input_count、cache_hit_ratio、index_version_lag。\n2. 若 query_rewrite 成功率下降且最近上线过新词典或新规则，优先检查改写规则。\n3. 若 recall_candidate_count 下降但索引版本滞后，优先考虑索引落后或索引未预热。\n4. 若 cache_hit_ratio 异常下降且最近改过缓存 key，优先检查兼容性。"
+      },
+      {
+        "role": "assistant",
+        "content": "我先根据运行手册去核查最近变更，确认是否有模型、索引、缓存或配置相关调整。"
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "id": "call_02",
+            "type": "function",
+            "function": {
+              "name": "get_recent_changes",
+              "arguments": "{\"time_range\":\"last_60m\",\"services\":[\"query-rewrite\",\"recall-service\",\"rerank-service\",\"cache-gateway\",\"index-loader\"]}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "call_02",
+        "content": "最近变更记录：\n1. 08:42 query-rewrite 服务上线 v2.14.7，引入新的行业词典和两条意图改写规则，变更说明提到“提高长尾 query 的改写覆盖率”，未附完整回归数据。\n2. 08:47 recall-service 热更新了缓存 key 生成逻辑，将 key 中的 tenant 字段从 tenantId 改为 tenant_id，目标是统一多语言服务的缓存命名规范。\n3. 08:51 rerank-service 无版本变更，但调整了重排前过滤阈值，预计会减少低质量候选进入 rerank。\n4. 08:54 index-loader 在华东二区触发一次增量索引预热，但华南一区因为磁盘 IO 抖动未完成预热，值班备注说“先观望”。\n5. 08:57 推荐链路有一次共享特征字典更新，但官方说明称该更新不应影响检索主链路。\n6. 09:03 cache-gateway 配置中心下发了一次连接池参数更新，最大连接数从 512 提到 768，并修改了空闲回收阈值。\n7. 09:05 业务方在灰度实验中打开了“短 query 快速降级”开关，灰度范围 8%，配置说明模糊，没有明确列出影响的 query 类型。\n8. 09:07 搜索前台并未发布新版本，但 nginx 路由层新增了一个用于大促分流的 header 转发规则。\n补充说明：变更中最需要优先核查的是 query-rewrite 规则、缓存 key 热更新、索引预热未完成和降级开关。"
+      },
+      {
+        "role": "assistant",
+        "content": "变更较多，我先拉监控摘要，看延迟抖动和空结果是否与改写、缓存、索引或降级命中相关。"
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "id": "call_03",
+            "type": "function",
+            "function": {
+              "name": "get_metrics_snapshot",
+              "arguments": "{\"window\":\"last_15m\",\"metrics\":[\"search_p95_ms\",\"search_error_rate\",\"rewrite_success_rate\",\"recall_candidate_count_p50\",\"cache_hit_ratio\",\"index_version_lag\",\"fast_degrade_hit_ratio\"]}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "call_03",
+        "content": "监控摘要（最近 15 分钟）：\n1. search_p95_ms 从 185ms 升到 468ms，峰值 612ms，波动主要集中在华东二区和华南一区。\n2. search_error_rate 没有明显上升，维持在 0.18% 到 0.26% 之间，说明大量请求没有显式报错。\n3. rewrite_success_rate 从 97.8% 降到 91.4%，其中短 query 和品牌词 query 的失败率提升明显。\n4. recall_candidate_count_p50 从 126 降到 38，且在两个有问题区域都能观察到下降。\n5. cache_hit_ratio 从 82% 降到 43%，下降时间点与 recall-service 缓存 key 热更新接近。\n6. index_version_lag 在华南一区升高到 2 个增量批次，华东二区短暂升高后又回落到 0。\n7. fast_degrade_hit_ratio 从 0.5% 升到 7.9%，主要出现在短 query 场景。\n8. GPU 使用率整体在 54% 到 61% 之间，没有出现算力打满现象；CPU 线程池排队在高峰瞬间增加，但不是持续性主因。\n9. rerank_input_count 与 recall_candidate_count 同步下降，说明候选减少发生在 rerank 之前。\n初步研判：问题可能并非来自 rerank 本身，更可能集中在改写、缓存、索引预热和降级分支。"
+      },
+      {
+        "role": "assistant",
+        "content": "监控更像是前置阶段出了问题。我继续看关键错误日志，确认是否有改写失败、缓存 miss 异常或索引未命中的信号。"
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "id": "call_04",
+            "type": "function",
+            "function": {
+              "name": "search_error_logs",
+              "arguments": "{\"window\":\"last_20m\",\"services\":[\"query-rewrite\",\"recall-service\",\"cache-gateway\",\"index-loader\"],\"keywords\":[\"rewrite failed\",\"cache key mismatch\",\"index lag\",\"fast degrade\"]}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "call_04",
+        "content": "关键日志摘要：\n1. query-rewrite 在 08:43 到 09:11 期间出现 1832 条 warning，典型日志为“rewrite failed: missing industry lexicon entry for tenant=retail-cn, fallback to raw query”。这表明新词典对部分租户并不完整。\n2. recall-service 在 08:48 后出现多条 info/warn 混合日志：“cache key mismatch detected, old_key_format=tenantId, new_key_format=tenant_id, fallback miss”。该日志未报错，但说明新旧 key 混用导致了大量缓存 miss。\n3. cache-gateway 没有出现连接池耗尽或显著 timeout，只有少量 idle recycle 调整日志，不能解释候选骤降。\n4. index-loader 在华南一区持续打印“incremental batch 20260321-03 not warmed, fallback serving older segment”。这说明华南一区存在索引预热未完成，可能影响部分查询的新鲜度和候选覆盖。\n5. fast degrade 相关日志显示，短 query 在 rewrite 失败且 recall 候选小于阈值时，会直接命中“快速降级到基础词召回”路径，该路径返回候选本就较少。\n6. rerank-service 几乎没有异常，只有少量“input candidates low”提示，符合上游候选不足的现象。\n7. 前台 nginx header 转发规则未见明显异常，没有证据说明它直接造成空结果。\n8. 整体来看，日志更支持“改写词典不完整 + 缓存 key 热更新导致 miss + 华南索引未预热”共同作用。"
+      },
+      {
+        "role": "assistant",
+        "content": "我再看配置差异，确认改写规则、缓存 key 和降级开关的配置是否存在兼容性风险。"
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "id": "call_05",
+            "type": "function",
+            "function": {
+              "name": "get_config_diff",
+              "arguments": "{\"services\":[\"query-rewrite\",\"recall-service\",\"search-frontend\"],\"time_range\":\"last_90m\"}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "call_05",
+        "content": "配置差异摘要：\n【query-rewrite】\n- 新增 rewrite_rule.brand_expand=true，仅对 retail-cn、fashion-cn、beauty-cn 生效。\n- 新版配置要求 industry_lexicon_version >= 20260318，但部分租户仍停留在 20260310。\n- fallback_on_missing_lexicon=true，会在词典缺失时退回原 query，但没有额外告警升级。\n【recall-service】\n- cache_key_template 从 {tenantId}:{query_hash}:{intent} 改为 {tenant_id}:{query_hash}:{intent}。\n- backward_compatible_old_cache_key=false，意味着新版本不会主动兼容旧 key。\n- cache_miss_force_remote_recall=true，理论上 miss 后应走远程召回，但若远程召回超时会回落到低候选分支。\n【search-frontend】\n- fast_query_degrade_enabled=true，灰度 8%。\n- degrade_when_rewrite_failed=true 且 degrade_when_candidate_low=true，两个条件任一满足都会触发快速降级。\n- 短 query 阈值从长度 <= 3 调整为长度 <= 5，因此更多 query 会进入降级判断。\n配置研判：query-rewrite 和 recall-service 都存在兼容性风险，前台降级阈值也会放大上游异常影响。"
+      },
+      {
+        "role": "assistant",
+        "content": "为了确认用户侧体感和问题集中点，我继续查看最近的工单评论和客服反馈。"
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "id": "call_06",
+            "type": "function",
+            "function": {
+              "name": "fetch_ticket_comments",
+              "arguments": "{\"queue\":\"search-incidents\",\"window\":\"last_30m\"}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "call_06",
+        "content": "工单评论摘要：\n1. 客服反馈最明显的问题是“短品牌词搜不到东西”以及“明明有商品却只有极少结果”。\n2. 大部分反馈来自 retail-cn 和 fashion-cn 两个租户，与新改写规则生效租户高度重合。\n3. 有用户提到刷新后偶尔恢复正常，说明问题可能与缓存命中和降级路径有关，而不是稳定性的彻底崩溃。\n4. 业务运营同学反馈华南一区的新上架商品更容易搜不到，怀疑索引新鲜度有问题。\n5. 另一些反馈指出长 query 影响相对较小，短 query 更明显，这与 fast_query_degrade 阈值放宽后的行为一致。\n6. 值班记录中有人提议直接扩容 recall-service，但另一位同学提醒“手册里要求先查配置和索引，不要直接扩容”。\n7. 多数工单没有报错截图，只有“结果太少”或“搜不到”的主观描述，说明问题偏功能退化而非系统不可用。\n结论倾向：用户体感与监控、日志和配置差异基本一致。"
+      },
+      {
+        "role": "assistant",
+        "content": "我继续看知识库检索结果，确认类似事故历史是如何处理的。"
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "id": "call_07",
+            "type": "function",
+            "function": {
+              "name": "search_kb",
+              "arguments": "{\"query\":\"缓存 key 兼容 改写词典 缺失 索引预热 未完成 检索空结果 历史事故\"}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "call_07",
+        "content": "知识库命中文档：\n【事故复盘 2025-11-03】\n- 某次召回空结果事故中，根因是缓存 key 模板升级时关闭了向后兼容，导致缓存 miss 激增，远程召回又因超时而走了低候选兜底分支。修复方式是临时打开 old_key 兼容并回滚降级阈值。\n【事故复盘 2026-01-14】\n- 新行业词典上线时部分租户词典未准备好，rewrite_success_rate 明显下降，品牌 query 退回原 query 后召回候选不足。处理方式是按租户回滚新词典灰度，并补充缺失词典。\n【运行案例 2026-02-28】\n- 索引预热未完成导致部分区域 serving older segment，表现为新上架内容不可见，但一般不会单独造成大范围延迟抖动，通常是“新鲜度下降”而非“全面空结果”。\n【经验总结】\n- 若同时出现 rewrite_success_rate 下滑、cache_hit_ratio 下跌和 fast_degrade_hit_ratio 上升，优先止损动作一般是：回滚改写规则灰度、恢复缓存 key 兼容、缩小快速降级条件，再观察。\n- 若华南一区存在索引 lag，则需要并行补做索引预热，但它通常不是短 query 空结果的唯一主因。"
+      },
+      {
+        "role": "assistant",
+        "content": "我需要确认华南一区索引预热的细节，再看集群或索引侧事件。"
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "id": "call_08",
+            "type": "function",
+            "function": {
+              "name": "get_cluster_events",
+              "arguments": "{\"cluster\":\"south-search-prod\",\"window\":\"last_40m\",\"services\":[\"index-loader\",\"recall-service\"]}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "call_08",
+        "content": "集群事件摘要：\n1. 08:53 south-search-prod 的 index-loader pod 因宿主机 IO wait 升高发生一次重启。\n2. 08:55 到 09:02 期间，增量 segment 20260321-03 的预热任务多次超时并重试，最终状态为 partial warmed。\n3. recall-service pod 没有出现 OOM 或 CrashLoopBackOff，仅有零星网络抖动 warning。\n4. node 级别没有大面积 CPU 或内存瓶颈，GPU 节点也没有明显异常。\n5. 一条备注写到：索引预热失败主要影响新鲜内容覆盖，不应直接造成所有 query 的候选骤降。\n6. 集群层没有发现能单独解释“跨区短 query 候选普遍下降”的全局异常。\n结论：华南索引问题属并发风险点，但不像唯一根因。"
+      },
+      {
+        "role": "assistant",
+        "content": "我还要看一下服务自检和降级命中明细，确认是否大量 query 因条件放宽而误触发快速降级。"
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "id": "call_09",
+            "type": "function",
+            "function": {
+              "name": "get_degrade_trace_samples",
+              "arguments": "{\"window\":\"last_10m\",\"sample_size\":20}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "call_09",
+        "content": "快速降级 trace 样本：\n1. query='耐克短袖'，rewrite_failed=true，candidate_count_after_recall=12，命中 degrade_when_rewrite_failed=true，返回基础词召回 6 个候选。\n2. query='苹果14壳'，rewrite_succeeded=false，candidate_count_after_recall=9，命中短 query 阈值 <=5 与 candidate_low 条件，返回候选 5。\n3. query='连衣裙'，rewrite_succeeded=true，但 cache miss 后远程召回超时，触发 candidate_low 降级，返回候选 8。\n4. query='戴森吹风机'，rewrite_failed=false，但 tenant=retail-cn 命中新规则后改写分支 fallback，最终候选 11。\n5. 20 个样本里有 14 个同时满足“短 query + 改写失败或候选过低”条件，说明前台降级放大了上游异常。\n6. trace 里未见 rerank 主动拒绝输入，表明问题发生在 rerank 之前。\n结论：快速降级不是根因，但在当前配置下放大了表现。"
+      },
+      {
+        "role": "assistant",
+        "content": "我再查版本和发布说明，确认这些变更是否本来就要求灰度更谨慎。"
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "id": "call_10",
+            "type": "function",
+            "function": {
+              "name": "get_release_notes",
+              "arguments": "{\"services\":[\"query-rewrite\",\"recall-service\",\"search-frontend\"],\"versions\":[\"v2.14.7\",\"hotfix-cache-key-20260321\",\"frontend-gray-20260321\"]}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "call_10",
+        "content": "发布说明摘录：\n1. query-rewrite v2.14.7 的发布说明写明“依赖行业词典 20260318+，如租户词典未同步完成，请勿全量打开规则”。\n2. recall-service 缓存 key 热更新说明写明“默认关闭 old key 兼容，仅在确认缓存层已双写后再关闭兼容”。当前现场未发现双写验证记录。\n3. search-frontend 的快速降级灰度说明写明“仅建议在 rewrite_success_rate 稳定且缓存命中率无异常时开启”。\n4. 三份说明都强调应分阶段观察，但现场多个变更在 20 分钟内连续叠加。\n5. 发布 owner 在说明末尾还写了“若出现候选下降，不建议先扩容，应先回滚高风险配置”。"
+      },
+      {
+        "role": "assistant",
+        "content": "我已经有比较明确的方向了，但还想确认资源层是否真的没有瓶颈，避免误判。"
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "id": "call_11",
+            "type": "function",
+            "function": {
+              "name": "get_resource_snapshot",
+              "arguments": "{\"window\":\"last_10m\",\"services\":[\"query-rewrite\",\"recall-service\",\"cache-gateway\",\"rerank-service\"]}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "call_11",
+        "content": "资源摘要：\n1. query-rewrite CPU 55% 到 68%，内存稳定，无 GC 抖动异常。\n2. recall-service CPU 61% 到 74%，线程池 queue 在峰值有上升，但没有持续堆积。\n3. cache-gateway CPU 42%，连接池使用率 63%，未出现接近上限的现象。\n4. rerank-service GPU 利用率 58%，显存平稳，没有被打满。\n5. 整体资源层未见“硬瓶颈”，说明当前延迟抖动更像逻辑退化和缓存 miss 导致的额外路径开销。\n6. 没有证据支持简单扩容就能根治问题。"
+      },
+      {
+        "role": "assistant",
+        "content": "接着我检查值班群摘要和人工研判，看看是否已有临时止损建议。"
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "id": "call_12",
+            "type": "function",
+            "function": {
+              "name": "fetch_warroom_notes",
+              "arguments": "{\"channel\":\"search-warroom\",\"window\":\"last_30m\"}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "call_12",
+        "content": "战情室摘要：\n1. 一线值班建议先回滚 query-rewrite 新规则，因为问题租户与规则生效租户高度重合。\n2. 平台同学建议同时恢复 recall-service 的 old key 兼容，不然缓存 miss 会持续放大远程召回压力。\n3. 前台同学建议把 fast_query_degrade 灰度先关掉或至少恢复短 query 阈值，因为现在很多正常短 query 被过度降级。\n4. 索引团队提醒华南预热问题要补做，但不建议把它当成唯一主因。\n5. 业务方更关心“搜不到”和“结果太少”，接受短时延迟略增，但不能接受结果明显错误。\n6. 没有人支持先扩容，大家共识是先回滚高风险逻辑。"
+      },
+      {
+        "role": "assistant",
+        "content": "为了补全证据链，我再看查询样本分布和受影响租户情况。"
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "id": "call_13",
+            "type": "function",
+            "function": {
+              "name": "get_query_distribution_report",
+              "arguments": "{\"window\":\"last_20m\"}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "call_13",
+        "content": "查询分布报告：\n1. 受影响最明显的 query 长度集中在 2 到 5 个字之间，占异常样本的 73%。\n2. retail-cn、fashion-cn、beauty-cn 三个租户贡献了 81% 的异常样本，与新改写规则的生效租户完全重合。\n3. 长 query 和英文 query 受影响较小，说明问题并非全量系统不可用，而是策略路径有偏差。\n4. 新上架商品不可见问题主要集中在华南一区，占总异常样本的 12%，规模小于短 query 候选骤降问题。\n5. 综合判断：主问题是策略和缓存兼容性，索引预热问题是次要并发因素。"
+      },
+      {
+        "role": "assistant",
+        "content": "我还需要核查回滚方案和风险，确认止损动作是否安全。"
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "id": "call_14",
+            "type": "function",
+            "function": {
+              "name": "get_rollback_plan",
+              "arguments": "{\"changes\":[\"query-rewrite-v2.14.7\",\"recall-cache-key-hotfix\",\"fast-query-degrade-gray\"]}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "call_14",
+        "content": "回滚方案：\n1. query-rewrite 可按租户关闭 brand_expand 规则，不需要整服务回滚，预计 3 分钟生效。\n2. recall-service 可通过配置热更新恢复 backward_compatible_old_cache_key=true，预计 2 分钟生效，无需重启。\n3. fast-query-degrade 灰度可在前台配置中心直接关闭或恢复到长度 <=3 的旧阈值，预计 1 分钟生效。\n4. 若以上动作完成后仍有部分新鲜度问题，则并行补做华南索引预热。\n5. 风险提示：同时回滚多个配置需要严格记录顺序，避免后续归因困难，但从业务止损角度这些动作都较安全。"
+      },
+      {
+        "role": "assistant",
+        "content": "我想确认是否存在历史根因标签或标准动作标签，方便后续输出更规范。"
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "id": "call_15",
+            "type": "function",
+            "function": {
+              "name": "get_incident_taxonomy",
+              "arguments": "{\"domain\":\"search_ops\"}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "call_15",
+        "content": "事件标签字典：\n1. RC-CFG：配置兼容性问题，包括开关条件、阈值、字段命名和模板变化。\n2. RC-DATA：数据或索引新鲜度问题，包括索引 lag、预热未完成、数据未同步。\n3. RC-RES：资源瓶颈问题，包括 CPU、内存、GPU、连接池、线程池。\n4. ACT-ROLLBACK：优先回滚高风险逻辑或配置。\n5. ACT-REWARM：补做索引或缓存预热。\n6. ACT-SCALE：扩容，仅在确认资源瓶颈时使用。\n7. ACT-OBSERVE：继续观察，不立即动作。\n注：若主因是多项配置叠加放大，应优先标记 RC-CFG。"
+      },
+      {
+        "role": "assistant",
+        "content": "我已经基本能下结论，但再看一次人工总结，确认没有遗漏的反证。"
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "id": "call_16",
+            "type": "function",
+            "function": {
+              "name": "fetch_manual_summary",
+              "arguments": "{\"author\":\"primary_oncall\",\"window\":\"last_15m\"}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "call_16",
+        "content": "人工总结：\n1. 没有发现单一资源瓶颈，也没有大面积服务不可用。\n2. 问题与多个高风险变更同时叠加高度相关：改写规则、缓存 key 兼容关闭、快速降级条件放宽。\n3. 索引预热未完成解释了华南新鲜度问题，但无法独立解释跨区短 query 候选骤降。\n4. 建议优先动作是回滚高风险配置，再补做华南索引预热。\n5. 如果必须用一个根因标签概括，本次更像 RC-CFG，而不是 RC-DATA 或 RC-RES。"
+      },
+      {
+        "role": "assistant",
+        "content": "我继续补充一轮知识库检索，看看针对 RC-CFG 场景的标准动作推荐。"
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "id": "call_17",
+            "type": "function",
+            "function": {
+              "name": "search_kb",
+              "arguments": "{\"query\":\"RC-CFG 检索链路 配置兼容性 标准止损动作\"}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "call_17",
+        "content": "知识库补充结果：\n1. RC-CFG 场景的标准顺序通常是：回滚高风险配置 -> 恢复兼容 -> 缩小灰度 -> 观察指标 -> 再决定是否继续修复。\n2. 对检索链路来说，优先级最高的常见动作包括关闭不完整的改写规则、恢复缓存 key 向后兼容、收紧快速降级条件。\n3. 如果同时存在索引预热问题，则作为并行动作处理，但一般不抢在高风险配置回滚之前。\n4. 若最终要输出动作标签，优先使用 ACT-ROLLBACK；若要输出根因标签，优先使用 RC-CFG。"
+      },
+      {
+        "role": "assistant",
+        "content": "我再看一次配置中心审计日志，确认这些配置确实是在同一时间窗口内叠加发布的。"
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "id": "call_18",
+            "type": "function",
+            "function": {
+              "name": "get_config_audit_log",
+              "arguments": "{\"window\":\"last_90m\",\"services\":[\"query-rewrite\",\"recall-service\",\"search-frontend\"]}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "call_18",
+        "content": "配置审计日志：\n1. 08:42 query-rewrite 的 industry lexicon and brand_expand rule 提交并生效。\n2. 08:47 recall-service 的 cache_key_template 与 backward_compatible_old_cache_key 提交并生效。\n3. 09:05 search-frontend 的 fast_query_degrade 相关阈值和灰度比例提交并生效。\n4. 三次变更都位于 25 分钟窗口内，且缺少联合回归记录。\n5. 审计结论：这是一次典型的高风险叠加发布。"
+      },
+      {
+        "role": "assistant",
+        "content": "为了让上下文更接近真实 war room，我再收一轮跨团队反馈。"
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "id": "call_19",
+            "type": "function",
+            "function": {
+              "name": "fetch_cross_team_feedback",
+              "arguments": "{\"teams\":[\"search-platform\",\"search-frontend\",\"index-team\",\"ops\"],\"window\":\"last_25m\"}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "call_19",
+        "content": "跨团队反馈：\n1. search-platform：最怀疑 query-rewrite 新规则和词典未同步。\n2. search-frontend：认为 fast degrade 阈值放宽让异常表现更明显。\n3. index-team：承认华南预热失败，但认为它只解释部分新鲜度问题。\n4. ops：强调缓存 key 向后兼容关闭是高风险操作，不应在大促压测期间单独上线。\n5. 统一意见：先回滚高风险配置，再补华南预热，暂不考虑扩容。"
+      },
+      {
+        "role": "assistant",
+        "content": "最后补一条执行记录，模拟 agent 历史继续累积。"
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "id": "call_20",
+            "type": "function",
+            "function": {
+              "name": "append_execution_note",
+              "arguments": "{\"note\":\"目前证据指向 RC-CFG，优先动作 ACT-ROLLBACK，华南索引预热作为并行动作。准备等待最终用户指令。\"}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "call_20",
+        "content": "执行记录已追加：\n- 当前主因候选：RC-CFG。\n- 当前首选动作：ACT-ROLLBACK。\n- 并行动作建议：ACT-REWARM（华南索引预热）。\n- 尚未执行任何真正止损动作，仅完成证据收集与归因整理。\n- 可以继续要求代理给出下一步、最终标签，或继续调查更多细节。"
+      }
+    ]
+  }
+}

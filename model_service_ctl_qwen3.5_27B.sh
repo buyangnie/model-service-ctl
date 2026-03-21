@@ -4,15 +4,15 @@ set -euo pipefail
 #######################################
 # 通用 vLLM 容器管理脚本（单服务版）
 # 当前默认环境：
-#   - 脚本目录: /dev/shm/run
-#   - 模型目录: /dev/shm/models/Qwen3.5-35B-A3B
+#   - 脚本目录: /opsfactory/model_service
+#   - 模型目录: /data/models/Qwen3.5-27B
 #######################################
 
 #######################################
 # Script Meta
 #######################################
 SCRIPT_NAME="$(basename "$0")"
-SCRIPT_VERSION="2.1.1"
+SCRIPT_VERSION="1.0"
 BASE_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 ROOT_LOG_DIR="${BASE_DIR}/logs"
@@ -32,15 +32,15 @@ ln -sfn "${RUN_LOG}" "${LATEST_LOG}" 2>/dev/null || true
 # Global Config
 # 可通过环境变量覆盖
 #######################################
-IMAGE="${IMAGE:-vllm/vllm-openai:v0.17.0-x86_64}"
+IMAGE="${IMAGE:-vllm/vllm-openai:nightly-x86_64}"
 API_KEY="${API_KEY:-change-me}"
 
-MODELS_ROOT="${MODELS_ROOT:-/dev/shm/models}"
+MODELS_ROOT="${MODELS_ROOT:-/data/models}"
 HF_CACHE="${HF_CACHE:-/data/hf_cache}"
 
 CONTAINER_NAME="${CONTAINER_NAME:-vllm-service}"
-MODEL_DIR="${MODEL_DIR:-/dev/shm/models/Qwen3.5-35B-A3B}"
-MODEL_NAME="${MODEL_NAME:-Qwen3.5-35B-A3B}"
+MODEL_DIR="${MODEL_DIR:-/data/models/Qwen3.5-27B}"
+MODEL_NAME="${MODEL_NAME:-Qwen3.5-27B}"
 
 HOST_PORT="${HOST_PORT:-8000}"
 CONTAINER_PORT="${CONTAINER_PORT:-8000}"
@@ -51,15 +51,27 @@ TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-4}"
 DTYPE="${DTYPE:-float16}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.85}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-16384}"
-MAX_NUM_SEQS="${MAX_NUM_SEQS:-8}"
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}"
 
-HEALTH_RETRIES="${HEALTH_RETRIES:-180}"
+# Official Qwen3.5 recipe on vLLM uses the qwen3 reasoning parser. Default to
+# text-only isolation first to reduce variables during validation.
+TOOL_CALL_PARSER="${TOOL_CALL_PARSER:-}"
+REASONING_PARSER="${REASONING_PARSER:-qwen3}"
+ENABLE_AUTO_TOOL_CHOICE="${ENABLE_AUTO_TOOL_CHOICE:-0}"
+LANGUAGE_MODEL_ONLY="${LANGUAGE_MODEL_ONLY:-1}"
+DISABLE_CUSTOM_ALL_REDUCE="${DISABLE_CUSTOM_ALL_REDUCE:-1}"
+ENFORCE_EAGER="${ENFORCE_EAGER:-1}"
+
+HEALTH_RETRIES="${HEALTH_RETRIES:-600}"
 HEALTH_INTERVAL="${HEALTH_INTERVAL:-2}"
 HEALTH_CONNECT_TIMEOUT="${HEALTH_CONNECT_TIMEOUT:-2}"
 HEALTH_MAX_TIME="${HEALTH_MAX_TIME:-8}"
 
 CURL_BIN="${CURL_BIN:-curl}"
 DOCKER_BIN="${DOCKER_BIN:-docker}"
+
+MODEL_DIR_REAL="${MODEL_DIR}"
+MODEL_EXTRA_MOUNT=""
 
 if [[ "${DEBUG:-0}" == "1" ]]; then
   set -x
@@ -106,6 +118,13 @@ Current defaults:
   GPU_DEVICES=${GPU_DEVICES}
   TENSOR_PARALLEL_SIZE=${TENSOR_PARALLEL_SIZE}
   MAX_MODEL_LEN=${MAX_MODEL_LEN}
+  MAX_NUM_SEQS=${MAX_NUM_SEQS}
+  TOOL_CALL_PARSER=${TOOL_CALL_PARSER}
+  REASONING_PARSER=${REASONING_PARSER}
+  ENABLE_AUTO_TOOL_CHOICE=${ENABLE_AUTO_TOOL_CHOICE}
+  LANGUAGE_MODEL_ONLY=${LANGUAGE_MODEL_ONLY}
+  DISABLE_CUSTOM_ALL_REDUCE=${DISABLE_CUSTOM_ALL_REDUCE}
+  ENFORCE_EAGER=${ENFORCE_EAGER}
 
 Logs:
   root dir : ${ROOT_LOG_DIR}
@@ -191,6 +210,51 @@ capture_cmd() {
   } >"${outfile}" 2>&1 || true
 }
 
+normalize_path() {
+  local path="${1:-}"
+  if [[ -z "${path}" ]]; then
+    echo "${path}"
+    return 0
+  fi
+
+  if [[ "${path}" == "/" ]]; then
+    echo "/"
+    return 0
+  fi
+
+  while [[ "${path}" == */ ]]; do
+    path="${path%/}"
+  done
+  echo "${path}"
+}
+
+resolve_model_dir() {
+  local resolved=""
+  MODELS_ROOT="$(normalize_path "${MODELS_ROOT}")"
+  HF_CACHE="$(normalize_path "${HF_CACHE}")"
+  MODEL_DIR="$(normalize_path "${MODEL_DIR}")"
+
+  if command -v readlink >/dev/null 2>&1; then
+    resolved="$(readlink -f "${MODEL_DIR}" 2>/dev/null || true)"
+  fi
+
+  if [[ -n "${resolved}" ]]; then
+    MODEL_DIR_REAL="$(normalize_path "${resolved}")"
+  else
+    MODEL_DIR_REAL="${MODEL_DIR}"
+  fi
+
+  MODEL_EXTRA_MOUNT=""
+  case "${MODEL_DIR_REAL}" in
+    "${MODELS_ROOT}"/*) ;;
+    *)
+      local real_parent
+      real_parent="$(dirname "${MODEL_DIR_REAL}")"
+      MODEL_EXTRA_MOUNT="${real_parent}:${real_parent}:ro"
+      ;;
+  esac
+}
+
 #######################################
 # Snapshot / Validation
 #######################################
@@ -212,6 +276,7 @@ save_env_snapshot() {
     echo "hf_cache=${HF_CACHE}"
     echo "container_name=${CONTAINER_NAME}"
     echo "model_dir=${MODEL_DIR}"
+    echo "model_dir_real=${MODEL_DIR_REAL}"
     echo "model_name=${MODEL_NAME}"
     echo "host_port=${HOST_PORT}"
     echo "container_port=${CONTAINER_PORT}"
@@ -221,6 +286,12 @@ save_env_snapshot() {
     echo "gpu_memory_utilization=${GPU_MEMORY_UTILIZATION}"
     echo "max_model_len=${MAX_MODEL_LEN}"
     echo "max_num_seqs=${MAX_NUM_SEQS}"
+    echo "tool_call_parser=${TOOL_CALL_PARSER}"
+    echo "reasoning_parser=${REASONING_PARSER}"
+    echo "enable_auto_tool_choice=${ENABLE_AUTO_TOOL_CHOICE}"
+    echo "language_model_only=${LANGUAGE_MODEL_ONLY}"
+    echo "disable_custom_all_reduce=${DISABLE_CUSTOM_ALL_REDUCE}"
+    echo "enforce_eager=${ENFORCE_EAGER}"
     echo
     echo "### uname -a ###"
     uname -a || true
@@ -247,12 +318,15 @@ save_env_snapshot() {
 }
 
 check_paths() {
+  resolve_model_dir
+
   [[ -d "${MODELS_ROOT}" ]] || { err "Models root not found: ${MODELS_ROOT}"; return 1; }
   [[ -d "${HF_CACHE}" ]] || { err "HF cache dir not found: ${HF_CACHE}"; return 1; }
   [[ -d "${MODEL_DIR}" ]] || { err "Model dir not found: ${MODEL_DIR}"; return 1; }
+  [[ -d "${MODEL_DIR_REAL}" ]] || { err "Resolved model dir not found: ${MODEL_DIR_REAL}"; return 1; }
 
-  if [[ ! -f "${MODEL_DIR}/config.json" && ! -f "${MODEL_DIR}/params.json" ]]; then
-    err "MODEL_DIR does not look like a valid model root: ${MODEL_DIR}"
+  if [[ ! -f "${MODEL_DIR_REAL}/config.json" && ! -f "${MODEL_DIR_REAL}/params.json" ]]; then
+    err "MODEL_DIR does not look like a valid model root: ${MODEL_DIR_REAL}"
     err "Expected config.json (HF) or params.json (Mistral-style)"
     return 1
   fi
@@ -261,6 +335,10 @@ check_paths() {
   log "  MODELS_ROOT = ${MODELS_ROOT}"
   log "  HF_CACHE    = ${HF_CACHE}"
   log "  MODEL_DIR   = ${MODEL_DIR}"
+  log "  MODEL_DIR_REAL = ${MODEL_DIR_REAL}"
+  if [[ -n "${MODEL_EXTRA_MOUNT}" ]]; then
+    log "  MODEL_EXTRA_MOUNT enabled for resolved symlink target"
+  fi
 }
 
 validate_image() {
@@ -312,6 +390,7 @@ validate_runtime() {
 validate_all() {
   require_bin "${DOCKER_BIN}"
   require_bin "${CURL_BIN}"
+  resolve_model_dir
 
   divider
   log "Validate start"
@@ -328,35 +407,68 @@ validate_all() {
 #######################################
 # Docker Run Command Builder
 # 这里用“位置参数”传模型目录，避免 --model 提示
+# Docker CLI 对 device=0,1,2,3 这种值要求保留内部引号，否则会把逗号拆成额外字段。
 #######################################
 build_run_cmd() {
-  cat <<EOF
-${DOCKER_BIN} run -d \
-  --name "${CONTAINER_NAME}" \
-  --restart unless-stopped \
-  # Docker CLI requires the full device list to remain a quoted literal.
-  --gpus '"${GPU_DEVICES}"' \
-  --ipc=host \
-  --ulimit memlock=-1 \
-  --ulimit stack=67108864 \
-  --log-opt max-size=100m \
-  --log-opt max-file=3 \
-  -p "${HOST_PORT}:${CONTAINER_PORT}" \
-  -v "${MODELS_ROOT}:${MODELS_ROOT}:ro" \
-  -v "${HF_CACHE}:${HF_CACHE}" \
-  -e HF_HOME="${HF_CACHE}" \
-  "${IMAGE}" \
-  "${MODEL_DIR}" \
-  --host 0.0.0.0 \
-  --port "${CONTAINER_PORT}" \
-  --served-model-name "${MODEL_NAME}" \
-  --api-key "${API_KEY}" \
-  --tensor-parallel-size "${TENSOR_PARALLEL_SIZE}" \
-  --dtype "${DTYPE}" \
-  --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}" \
-  --max-model-len "${MAX_MODEL_LEN}" \
-  --max-num-seqs "${MAX_NUM_SEQS}"
-EOF
+  resolve_model_dir
+  local -a cmd
+  cmd=(
+    "${DOCKER_BIN}" run -d
+    --name "${CONTAINER_NAME}"
+    --restart unless-stopped
+    --gpus "\"${GPU_DEVICES}\""
+    --ipc=host
+    --ulimit memlock=-1
+    --ulimit stack=67108864
+    --log-opt max-size=100m
+    --log-opt max-file=3
+    -p "${HOST_PORT}:${CONTAINER_PORT}"
+    -v "${MODELS_ROOT}:${MODELS_ROOT}:ro"
+    -v "${HF_CACHE}:${HF_CACHE}"
+    -e "HF_HOME=${HF_CACHE}"
+    "${IMAGE}"
+    "${MODEL_DIR_REAL}"
+    --host 0.0.0.0
+    --port "${CONTAINER_PORT}"
+    --served-model-name "${MODEL_NAME}"
+    --api-key "${API_KEY}"
+    --tensor-parallel-size "${TENSOR_PARALLEL_SIZE}"
+    --dtype "${DTYPE}"
+    --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}"
+    --max-model-len "${MAX_MODEL_LEN}"
+    --max-num-seqs "${MAX_NUM_SEQS}"
+  )
+
+  if [[ -n "${MODEL_EXTRA_MOUNT}" ]]; then
+    cmd+=(-v "${MODEL_EXTRA_MOUNT}")
+  fi
+
+  if [[ -n "${TOOL_CALL_PARSER}" ]]; then
+    cmd+=(--tool-call-parser "${TOOL_CALL_PARSER}")
+  fi
+
+  if [[ -n "${REASONING_PARSER}" ]]; then
+    cmd+=(--reasoning-parser "${REASONING_PARSER}")
+  fi
+
+  if [[ "${ENABLE_AUTO_TOOL_CHOICE}" == "1" ]]; then
+    cmd+=(--enable-auto-tool-choice)
+  fi
+
+  if [[ "${DISABLE_CUSTOM_ALL_REDUCE}" == "1" ]]; then
+    cmd+=(--disable-custom-all-reduce)
+  fi
+
+  if [[ "${ENFORCE_EAGER}" == "1" ]]; then
+    cmd+=(--enforce-eager)
+  fi
+
+  if [[ "${LANGUAGE_MODEL_ONLY}" == "1" ]]; then
+    cmd+=(--language-model-only)
+  fi
+
+  printf '%q ' "${cmd[@]}"
+  printf '\n'
 }
 
 #######################################
@@ -370,12 +482,45 @@ probe_api() {
     -H "Authorization: Bearer ${API_KEY}"
 }
 
+probe_health_endpoint() {
+  ${CURL_BIN} -fsS \
+    --connect-timeout "${HEALTH_CONNECT_TIMEOUT}" \
+    --max-time "${HEALTH_MAX_TIME}" \
+    "http://127.0.0.1:${HOST_PORT}/health"
+}
+
+probe_ping_endpoint() {
+  ${CURL_BIN} -fsS \
+    --connect-timeout "${HEALTH_CONNECT_TIMEOUT}" \
+    --max-time "${HEALTH_MAX_TIME}" \
+    "http://127.0.0.1:${HOST_PORT}/ping"
+}
+
+status_probe_result() {
+  local label="$1"
+  shift
+  if "$@" >/dev/null 2>&1; then
+    printf '%-8s: READY\n' "${label}"
+  else
+    printf '%-8s: FAIL\n' "${label}"
+  fi
+}
+
+container_logs_show_ready_markers() {
+  ${DOCKER_BIN} logs --tail 200 "${CONTAINER_NAME}" 2>&1 | grep -Eq \
+    'Application startup complete|Starting vLLM API server|Route: /v1/models'
+}
+
 health_check() {
   local retries="${1:-${HEALTH_RETRIES}}"
   local interval="${2:-${HEALTH_INTERVAL}}"
   local out_file="${LOG_DIR}/healthcheck.txt"
   local status=""
   local rc=0
+  local api_rc=0
+  local health_rc=0
+  local ping_rc=0
+  local log_ready=no
 
   log "Checking health for ${CONTAINER_NAME} on port ${HOST_PORT} (timeout=$((retries * interval))s)"
 
@@ -404,18 +549,50 @@ health_check() {
     {
       echo "attempt=${i} timestamp=$(ts)"
       echo "container_status=${status}"
-      if probe_api; then
+      api_rc=0
+      health_rc=0
+      ping_rc=0
+      log_ready=no
+
+      if probe_api >/dev/null; then
+        api_rc=0
+      else
+        api_rc=$?
+      fi
+
+      if probe_health_endpoint >/dev/null; then
+        health_rc=0
+      else
+        health_rc=$?
+      fi
+
+      if probe_ping_endpoint >/dev/null; then
+        ping_rc=0
+      else
+        ping_rc=$?
+      fi
+
+      if container_logs_show_ready_markers; then
+        log_ready=yes
+      fi
+
+      if [[ "${api_rc}" -eq 0 || "${health_rc}" -eq 0 || "${ping_rc}" -eq 0 ]]; then
         rc=0
       else
-        rc=$?
+        rc=1
       fi
+
+      echo "api_exit_code=${api_rc}"
+      echo "health_exit_code=${health_rc}"
+      echo "ping_exit_code=${ping_rc}"
+      echo "log_ready_markers=${log_ready}"
       echo
       echo "exit_code=${rc}"
       echo "----------------------------------------"
     } >> "${out_file}" 2>&1 || true
 
     if (( i % 10 == 0 )); then
-      log "Health check still waiting: attempt=${i}/${retries}, container_status=${status}"
+      log "Health check still waiting: attempt=${i}/${retries}, container_status=${status}, api=${api_rc}, health=${health_rc}, ping=${ping_rc}, log_ready=${log_ready}"
     fi
 
     if [[ "${rc}" -eq 0 ]]; then
@@ -477,6 +654,7 @@ collect_failure_context() {
     echo "failure_reason=${failure_reason}"
     echo "container_name=${CONTAINER_NAME}"
     echo "model_dir=${MODEL_DIR}"
+    echo "model_dir_real=${MODEL_DIR_REAL}"
     echo "model_name=${MODEL_NAME}"
     echo "image=${IMAGE}"
     echo "models_root=${MODELS_ROOT}"
@@ -489,6 +667,13 @@ collect_failure_context() {
     echo "gpu_memory_utilization=${GPU_MEMORY_UTILIZATION}"
     echo "max_model_len=${MAX_MODEL_LEN}"
     echo "max_num_seqs=${MAX_NUM_SEQS}"
+    echo "tool_call_parser=${TOOL_CALL_PARSER}"
+    echo "reasoning_parser=${REASONING_PARSER}"
+    echo "enable_auto_tool_choice=${ENABLE_AUTO_TOOL_CHOICE}"
+    echo "language_model_only=${LANGUAGE_MODEL_ONLY}"
+    echo "disable_custom_all_reduce=${DISABLE_CUSTOM_ALL_REDUCE}"
+    echo "enforce_eager=${ENFORCE_EAGER}"
+    echo "model_extra_mount=$(printf '%s' "${MODEL_EXTRA_MOUNT}")"
     echo
 
     echo "==================== start_command.txt ===================="
@@ -659,7 +844,7 @@ start_service() {
 
 stop_service() {
   divider
-  log "Stopping container: ${CONTAINER_NAME}"
+  log "Stop requested for container: ${CONTAINER_NAME}"
   stop_container_if_exists
 }
 
@@ -678,6 +863,7 @@ logs_service() {
 }
 
 status_service() {
+  resolve_model_dir
   divider
   echo "Script Info" | tee -a "${RUN_LOG}"
   divider
@@ -687,7 +873,15 @@ status_service() {
   echo "LOG_DIR        : ${LOG_DIR}" | tee -a "${RUN_LOG}"
   echo "IMAGE          : ${IMAGE}" | tee -a "${RUN_LOG}"
   echo "MODEL_DIR      : ${MODEL_DIR}" | tee -a "${RUN_LOG}"
+  echo "MODEL_DIR_REAL : ${MODEL_DIR_REAL}" | tee -a "${RUN_LOG}"
   echo "MODEL_NAME     : ${MODEL_NAME}" | tee -a "${RUN_LOG}"
+  echo "MAX_NUM_SEQS   : ${MAX_NUM_SEQS}" | tee -a "${RUN_LOG}"
+  echo "TOOL_CALL_PARSER : ${TOOL_CALL_PARSER}" | tee -a "${RUN_LOG}"
+  echo "REASONING_PARSER : ${REASONING_PARSER}" | tee -a "${RUN_LOG}"
+  echo "ENABLE_AUTO_TOOL_CHOICE : ${ENABLE_AUTO_TOOL_CHOICE}" | tee -a "${RUN_LOG}"
+  echo "LANGUAGE_MODEL_ONLY : ${LANGUAGE_MODEL_ONLY}" | tee -a "${RUN_LOG}"
+  echo "DISABLE_CUSTOM_ALL_REDUCE : ${DISABLE_CUSTOM_ALL_REDUCE}" | tee -a "${RUN_LOG}"
+  echo "ENFORCE_EAGER : ${ENFORCE_EAGER}" | tee -a "${RUN_LOG}"
 
   echo | tee -a "${RUN_LOG}"
   divider
@@ -697,16 +891,21 @@ status_service() {
 
   echo | tee -a "${RUN_LOG}"
   divider
-  echo "API Health Check" | tee -a "${RUN_LOG}"
+  echo "Probe Status" | tee -a "${RUN_LOG}"
   divider
   if container_running; then
-    if probe_api >/dev/null 2>&1; then
-      echo "API : READY   (http://127.0.0.1:${HOST_PORT})" | tee -a "${RUN_LOG}"
+    status_probe_result "models" probe_api | tee -a "${RUN_LOG}"
+    status_probe_result "health" probe_health_endpoint | tee -a "${RUN_LOG}"
+    status_probe_result "ping" probe_ping_endpoint | tee -a "${RUN_LOG}"
+    if probe_api >/dev/null 2>&1 || probe_health_endpoint >/dev/null 2>&1 || probe_ping_endpoint >/dev/null 2>&1; then
+      echo "CONTROL  : READY   (http://127.0.0.1:${HOST_PORT})" | tee -a "${RUN_LOG}"
     else
-      echo "API : NOT READY / STARTING (http://127.0.0.1:${HOST_PORT})" | tee -a "${RUN_LOG}"
+      echo "CONTROL  : NOT READY / STARTING (http://127.0.0.1:${HOST_PORT})" | tee -a "${RUN_LOG}"
     fi
+    echo "INFER    : NOT VERIFIED (status only checks endpoints, not generation)" | tee -a "${RUN_LOG}"
   else
-    echo "API : STOPPED" | tee -a "${RUN_LOG}"
+    echo "CONTROL  : STOPPED" | tee -a "${RUN_LOG}"
+    echo "INFER    : NOT VERIFIED" | tee -a "${RUN_LOG}"
   fi
 
   echo | tee -a "${RUN_LOG}"
