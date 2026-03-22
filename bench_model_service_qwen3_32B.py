@@ -15,13 +15,13 @@ from datetime import datetime
 from typing import Callable, Dict, List, Optional, Tuple
 
 
-SCRIPT_VERSION = "4"
+SCRIPT_VERSION = "5"
 BASE_URL = os.environ.get("MODEL_SERVICE_BASE_URL", "http://127.0.0.1:8000/v1")
 API_KEY = os.environ.get("MODEL_SERVICE_API_KEY", "change-me")
 MODELS = [
     {
-        "name": "c4ai-command-r-08-2024",
-        "tokenizer": "/data/models/c4ai-command-08-2024",
+        "name": "Qwen3-32B",
+        "tokenizer": "/data/models/Qwen3-32B",
     },
 ]
 
@@ -34,6 +34,7 @@ DEFAULT_FIRST_TOKEN_TIMEOUT = 60
 DEFAULT_PROGRESS_INTERVAL = 5
 DEFAULT_REPORT_PREFIX = "model_service_benchmark_report"
 DEFAULT_TESTSET_PATH = "model_service_testset.json"
+DEFAULT_THINKING_MODE = os.environ.get("MODEL_SERVICE_THINKING_MODE", "no_think")
 
 
 def join_sections(title: str, sections: List[str]) -> str:
@@ -69,27 +70,7 @@ def build_agentic_planning_case() -> dict:
             },
         ],
         "max_tokens": 48,
-        "contains": ["1.", "2.", "3."],
-    }
-
-
-def build_instruction_following_case() -> dict:
-    sections = [
-        "你将看到一组资料摘要、排障记录和补充说明，这些内容只用于增加上下文长度，不影响最终回答格式。",
-        "排障记录一：向量检索返回耗时 480ms，属于可接受范围，但需要继续观察索引热身状态。",
-        "排障记录二：用户反馈偶尔看到旧版本答案，经确认是缓存尚未失效，而不是模型幻觉。",
-        "补充说明：本轮测试仅验证模型是否能在长上下文中严格遵守输出格式，而不是验证知识正确性。",
-        "请忽略所有干扰信息，最终只输出“收到”，不要有标点、解释、引号或换行。"
-    ]
-    return {
-        "name": "instruction_following_long_context",
-        "description": "长输入下的严格指令遵循",
-        "messages": [
-            {"role": "system", "content": "你是一个严格遵守最终输出要求的中文助手。"},
-            {"role": "user", "content": join_sections("请阅读以下长材料。", sections * 10)},
-        ],
-        "max_tokens": 8,
-        "regex": r"^\s*收到\s*$",
+        "contains": ["检索", "核验", "升级"],
     }
 
 
@@ -151,10 +132,30 @@ def build_rag_fact_case() -> dict:
 
 SMOKE_CASES = [
     build_agentic_planning_case(),
-    build_instruction_following_case(),
     build_rag_json_case(),
     build_rag_fact_case(),
 ]
+
+
+def apply_thinking_mode(messages: List[dict], thinking_mode: str) -> List[dict]:
+    if thinking_mode == "think":
+        return messages
+
+    patched = [dict(message) for message in messages]
+    injected = False
+    for message in patched:
+        if message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            message["content"] = f"/no_think\n{content}"
+            injected = True
+            break
+    if not injected and patched:
+        content = patched[0].get("content", "")
+        if isinstance(content, str):
+            patched[0]["content"] = f"/no_think\n{content}"
+    return patched
 
 
 @dataclass
@@ -234,6 +235,7 @@ class SmokeResult:
 class BenchResult:
     model: str
     case_name: str
+    thinking_mode: str
     context_tokens_target: int
     success: bool
     http_status: Optional[int]
@@ -977,6 +979,7 @@ def run_smoke_tests(
     first_token_timeout: int,
     progress_interval: int,
     estimator: TokenEstimator,
+    thinking_mode: str,
 ) -> List[SmokeResult]:
     results: List[SmokeResult] = []
     suite_start = time.perf_counter()
@@ -989,12 +992,14 @@ def run_smoke_tests(
         print(f"  tokenizer: {estimator.status(tokenizer_ref)}", flush=True)
 
         for case in SMOKE_CASES:
+            request_messages = apply_thinking_mode(case["messages"], thinking_mode)
             print(f"[RUN][SMOKE] {case['name']} - {case['description']}", flush=True)
             metrics_before = collect_metrics_snapshot(base_url, api_key, timeout)
-            prompt_tokens_estimated = estimator.count_messages(tokenizer_ref, case["messages"])
+            prompt_tokens_estimated = estimator.count_messages(tokenizer_ref, request_messages)
             print(
                 f"  request: prompt_tokens_estimated={prompt_tokens_estimated} "
-                f"max_tokens={int(case['max_tokens'])} temperature={temperature} timeout={timeout}s",
+                f"max_tokens={int(case['max_tokens'])} temperature={temperature} timeout={timeout}s "
+                f"thinking_mode={thinking_mode}",
                 flush=True,
             )
             print(f"  metrics_before: {format_metrics_snapshot(metrics_before)}", flush=True)
@@ -1004,7 +1009,7 @@ def run_smoke_tests(
                     base_url=base_url,
                     model=model_name,
                     api_key=api_key,
-                    messages=case["messages"],
+                    messages=request_messages,
                     max_tokens=int(case["max_tokens"]),
                     temperature=temperature,
                     timeout=timeout,
@@ -1094,10 +1099,12 @@ def run_bench_tests(
     first_token_timeout: int,
     progress_interval: int,
     estimator: TokenEstimator,
+    thinking_mode: str,
 ) -> List[BenchResult]:
     results: List[BenchResult] = []
     suite_start = time.perf_counter()
     testset = load_testset(testset_path)
+    bench_thinking_modes = ["think", "no_think"]
 
     for model_cfg in models:
         model_name = model_cfg["name"]
@@ -1106,91 +1113,99 @@ def run_bench_tests(
         print(f"\n[MODEL][BENCH] {model_name}", flush=True)
         print(f"  tokenizer: {estimator.status(tokenizer_ref)}", flush=True)
         bench_cases = build_bench_cases_from_testset(testset, tokenizer_ref, estimator)
-
-        previous_prompt_tokens = -1
+        mode_aborted = {mode: False for mode in bench_thinking_modes}
+        previous_prompt_tokens = {mode: -1 for mode in bench_thinking_modes}
         for case in bench_cases:
-            prompt_tokens_estimated = int(case["prompt_tokens_estimated"])
-            if prompt_tokens_estimated <= previous_prompt_tokens:
-                raise ValueError(
-                    f"Bench case '{case['name']}' prompt length did not grow monotonically: "
-                    f"{prompt_tokens_estimated} <= {previous_prompt_tokens}"
+            for bench_mode in bench_thinking_modes:
+                if mode_aborted[bench_mode]:
+                    continue
+                request_messages = apply_thinking_mode(case["messages"], bench_mode)
+                prompt_tokens_estimated = estimator.count_messages(tokenizer_ref, request_messages)
+                if prompt_tokens_estimated <= previous_prompt_tokens[bench_mode]:
+                    raise ValueError(
+                        f"Bench case '{case['name']}' prompt length did not grow monotonically "
+                        f"for mode '{bench_mode}': {prompt_tokens_estimated} <= {previous_prompt_tokens[bench_mode]}"
+                    )
+                previous_prompt_tokens[bench_mode] = prompt_tokens_estimated
+                print(
+                    f"[RUN][BENCH] case={case['name']} mode={bench_mode} "
+                    f"tool_calls_included={case['tool_calls_included']} "
+                    f"prompt_tokens_estimated={prompt_tokens_estimated}",
+                    flush=True,
                 )
-            previous_prompt_tokens = prompt_tokens_estimated
-            print(
-                f"[RUN][BENCH] case={case['name']} tool_calls_included={case['tool_calls_included']} "
-                f"prompt_tokens_estimated={prompt_tokens_estimated}",
-                flush=True,
-            )
-            metrics_before = collect_metrics_snapshot(base_url, api_key, timeout)
-            print(
-                f"  request: prompt_tokens_estimated={prompt_tokens_estimated} "
-                f"max_tokens={max_tokens} temperature={temperature} timeout={timeout}s",
-                flush=True,
-            )
-            print(f"  metrics_before: {format_metrics_snapshot(metrics_before)}", flush=True)
-            response = run_with_progress(
-                lambda: run_stream_chat(
-                    base_url=base_url,
-                    model=model_name,
-                    api_key=api_key,
-                    messages=case["messages"],
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    timeout=timeout,
-                    first_token_timeout=first_token_timeout,
-                    on_first_token=lambda elapsed: print(
-                        f"  first token arrived at {elapsed:.3f}s",
-                        flush=True,
+                metrics_before = collect_metrics_snapshot(base_url, api_key, timeout)
+                print(
+                    f"  request: prompt_tokens_estimated={prompt_tokens_estimated} "
+                    f"max_tokens={max_tokens} temperature={temperature} timeout={timeout}s "
+                    f"thinking_mode={bench_mode}",
+                    flush=True,
+                )
+                print(f"  metrics_before: {format_metrics_snapshot(metrics_before)}", flush=True)
+                response = run_with_progress(
+                    lambda: run_stream_chat(
+                        base_url=base_url,
+                        model=model_name,
+                        api_key=api_key,
+                        messages=request_messages,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        timeout=timeout,
+                        first_token_timeout=first_token_timeout,
+                        on_first_token=lambda elapsed: print(
+                            f"  first token arrived at {elapsed:.3f}s",
+                            flush=True,
+                        ),
                     ),
-                ),
-                progress_interval=progress_interval,
-            )
-            metrics_after = collect_metrics_snapshot(base_url, api_key, timeout)
-            completion_tokens_estimated = estimator.count_text(tokenizer_ref, response.output_text)
-            output_tps = make_output_tps_estimated(completion_tokens_estimated, response.decode_seconds)
+                    progress_interval=progress_interval,
+                )
+                metrics_after = collect_metrics_snapshot(base_url, api_key, timeout)
+                completion_tokens_estimated = estimator.count_text(tokenizer_ref, response.output_text)
+                output_tps = make_output_tps_estimated(completion_tokens_estimated, response.decode_seconds)
 
-            result = BenchResult(
-                model=model_name,
-                case_name=case["name"],
-                context_tokens_target=prompt_tokens_estimated,
-                success=response.success,
-                http_status=response.http_status,
-                error=response.error,
-                ttft_seconds=response.ttft_seconds,
-                total_seconds=response.total_seconds,
-                decode_seconds=response.decode_seconds,
-                raw_chunks=response.raw_chunks,
-                prompt_tokens_estimated=prompt_tokens_estimated,
-                completion_tokens_estimated=completion_tokens_estimated,
-                prompt_tokens_reported=response.prompt_tokens_reported,
-                completion_tokens_reported=response.completion_tokens_reported,
-                total_tokens_reported=response.total_tokens_reported,
-                output_tps_estimated=output_tps,
-                output_preview=build_output_preview(response.output_text),
-                metrics_before=metrics_before,
-                metrics_after=metrics_after,
-            )
-            results.append(result)
+                result = BenchResult(
+                    model=model_name,
+                    case_name=case["name"],
+                    thinking_mode=bench_mode,
+                    context_tokens_target=prompt_tokens_estimated,
+                    success=response.success,
+                    http_status=response.http_status,
+                    error=response.error,
+                    ttft_seconds=response.ttft_seconds,
+                    total_seconds=response.total_seconds,
+                    decode_seconds=response.decode_seconds,
+                    raw_chunks=response.raw_chunks,
+                    prompt_tokens_estimated=prompt_tokens_estimated,
+                    completion_tokens_estimated=completion_tokens_estimated,
+                    prompt_tokens_reported=response.prompt_tokens_reported,
+                    completion_tokens_reported=response.completion_tokens_reported,
+                    total_tokens_reported=response.total_tokens_reported,
+                    output_tps_estimated=output_tps,
+                    output_preview=build_output_preview(response.output_text),
+                    metrics_before=metrics_before,
+                    metrics_after=metrics_after,
+                )
+                results.append(result)
 
-            if result.success:
-                print(
-                    f"  ok ttft={fmt(result.ttft_seconds)}s total={fmt(result.total_seconds)}s "
-                    f"completion_tokens={result.completion_tokens_estimated} tps={fmt(result.output_tps_estimated)}",
-                    flush=True,
-                )
-            else:
-                print(
-                    f"  fail status={result.http_status} error={shorten(result.error, 160)}",
-                    flush=True,
-                )
-            print(f"  output_preview: {result.output_preview}", flush=True)
-            print(f"  metrics_after: {format_metrics_snapshot(metrics_after)}", flush=True)
-            if response.first_token_timeout_triggered:
-                print(
-                    f"  stop: first token exceeded {first_token_timeout}s, aborting remaining bench tests",
-                    flush=True,
-                )
-                return results
+                if result.success:
+                    print(
+                        f"  ok ttft={fmt(result.ttft_seconds)}s total={fmt(result.total_seconds)}s "
+                        f"completion_tokens={result.completion_tokens_estimated} tps={fmt(result.output_tps_estimated)}",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"  fail status={result.http_status} error={shorten(result.error, 160)}",
+                        flush=True,
+                    )
+                print(f"  output_preview: {result.output_preview}", flush=True)
+                print(f"  metrics_after: {format_metrics_snapshot(metrics_after)}", flush=True)
+                if response.first_token_timeout_triggered:
+                    mode_aborted[bench_mode] = True
+                    print(
+                        f"  stop: first token exceeded {first_token_timeout}s, "
+                        f"aborting remaining bench tests for mode={bench_mode}",
+                        flush=True,
+                    )
 
         model_results = [item for item in results if item.model == model_name]
         ok_count = sum(1 for item in model_results if item.success)
@@ -1296,11 +1311,18 @@ def render_markdown_report(
     temperature: float,
     timeout: int,
     first_token_timeout: int,
+    thinking_mode: str,
     environment: EnvironmentSnapshot,
     estimator: TokenEstimator,
     smoke_results: List[SmokeResult],
     bench_results: List[BenchResult],
 ) -> str:
+    def get_bench_row(model_name: str, case_name: str, mode_name: str) -> Optional[BenchResult]:
+        for row in bench_results:
+            if row.model == model_name and row.case_name == case_name and row.thinking_mode == mode_name:
+                return row
+        return None
+
     lines: List[str] = []
     lines.append("# Model Service Benchmark Report")
     lines.append("")
@@ -1313,6 +1335,7 @@ def render_markdown_report(
     lines.append(f"- Models: `{', '.join(item['name'] for item in models)}`")
     lines.append(f"- Context sizes: `{','.join(str(x) for x in context_sizes)}`")
     lines.append(f"- Bench testset: `{testset_path}`")
+    lines.append(f"- Thinking mode: `{thinking_mode}`")
     lines.append(f"- Max output tokens: `{max_tokens}`")
     lines.append(f"- Temperature: `{temperature}`")
     lines.append(f"- Timeout per request: `{timeout}s`")
@@ -1423,10 +1446,52 @@ def render_markdown_report(
         lines.append("## Bench Results")
         lines.append("")
         lines.append(
-            "| Model | Case | Prompt Tokens | Success | HTTP | TTFT (s) | Total (s) | Decode (s) | Completion Tokens | Output TPS | Chunks | Output Preview | Service Metrics |"
+            "| Model | Case | Prompt Tokens (think/no_think) | Think OK | NoThink OK | Think TTFT (s) | NoThink TTFT (s) | Think Total (s) | NoThink Total (s) | Think Completion | NoThink Completion | Think Output | NoThink Output |"
         )
         lines.append(
-            "| --- | --- | ---: | :---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |"
+            "| --- | --- | --- | :---: | :---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |"
+        )
+        comparison_keys = []
+        seen = set()
+        for row in bench_results:
+            key = (row.model, row.case_name)
+            if key not in seen:
+                seen.add(key)
+                comparison_keys.append(key)
+        for model_name, case_name in comparison_keys:
+            think_row = get_bench_row(model_name, case_name, "think")
+            no_think_row = get_bench_row(model_name, case_name, "no_think")
+            prompt_pair = f"{think_row.prompt_tokens_reported or think_row.prompt_tokens_estimated if think_row else ''}/{no_think_row.prompt_tokens_reported or no_think_row.prompt_tokens_estimated if no_think_row else ''}"
+            lines.append(
+                "| "
+                + " | ".join(
+                    [
+                        model_name,
+                        case_name,
+                        prompt_pair,
+                        "Y" if think_row and think_row.success else "N",
+                        "Y" if no_think_row and no_think_row.success else "N",
+                        fmt(think_row.ttft_seconds) if think_row else "",
+                        fmt(no_think_row.ttft_seconds) if no_think_row else "",
+                        fmt(think_row.total_seconds) if think_row else "",
+                        fmt(no_think_row.total_seconds) if no_think_row else "",
+                        str(think_row.completion_tokens_reported or think_row.completion_tokens_estimated) if think_row else "",
+                        str(no_think_row.completion_tokens_reported or no_think_row.completion_tokens_estimated) if no_think_row else "",
+                        (think_row.output_preview if think_row else "").replace("|", "\\|"),
+                        (no_think_row.output_preview if no_think_row else "").replace("|", "\\|"),
+                    ]
+                )
+                + " |"
+            )
+
+        lines.append("")
+        lines.append("### Bench Per-Mode Details")
+        lines.append("")
+        lines.append(
+            "| Model | Case | Mode | Prompt Tokens | Success | HTTP | TTFT (s) | Total (s) | Decode (s) | Completion Tokens | Output TPS | Chunks | Output Preview | Service Metrics |"
+        )
+        lines.append(
+            "| --- | --- | --- | :---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |"
         )
         for row in bench_results:
             lines.append(
@@ -1435,7 +1500,8 @@ def render_markdown_report(
                     [
                         row.model,
                         row.case_name,
-                        str(row.context_tokens_target),
+                        row.thinking_mode,
+                        str(row.prompt_tokens_reported or row.prompt_tokens_estimated),
                         "Y" if row.success else "N",
                         str(row.http_status or ""),
                         fmt(row.ttft_seconds),
@@ -1475,6 +1541,7 @@ def render_markdown_report(
                 "models": models,
                 "context_sizes": context_sizes,
                 "testset_path": testset_path,
+                "thinking_mode": thinking_mode,
                 "max_tokens": max_tokens,
                 "temperature": temperature,
                 "timeout": timeout,
@@ -1521,13 +1588,14 @@ def print_bench_summary(results: List[BenchResult]) -> None:
     if not results:
         return
     print("\n[SUMMARY][BENCH]", flush=True)
-    print("model\tcase\tprompt_toks\tok\tstatus\tttft_s\ttotal_s\tdecode_s\tcompletion_toks\tout_tps\tchunks", flush=True)
+    print("model\tcase\tmode\tprompt_toks\tok\tstatus\tttft_s\ttotal_s\tdecode_s\tcompletion_toks\tout_tps\tchunks", flush=True)
     for row in results:
         print(
             "\t".join(
                 [
                     row.model,
                     row.case_name,
+                    row.thinking_mode,
                     str(row.context_tokens_target),
                     "Y" if row.success else "N",
                     str(row.http_status or ""),
@@ -1595,6 +1663,7 @@ def main() -> int:
     parser.add_argument("--first-token-timeout", type=int, default=DEFAULT_FIRST_TOKEN_TIMEOUT, help="Fail if first token is not received within this many seconds; abort remaining tests")
     parser.add_argument("--progress-interval", type=int, default=DEFAULT_PROGRESS_INTERVAL, help="Progress log interval in seconds")
     parser.add_argument("--testset", default=DEFAULT_TESTSET_PATH, help="Bench-mode testset JSON path")
+    parser.add_argument("--thinking-mode", choices=["think", "no_think"], default=DEFAULT_THINKING_MODE, help="Request-side Qwen thinking control")
     parser.add_argument("--markdown-output", default="", help="Optional Markdown report file path")
     args = parser.parse_args()
 
@@ -1615,6 +1684,7 @@ def main() -> int:
     print(f"Mode: {args.mode}", flush=True)
     print(f"Context sizes: {context_sizes}", flush=True)
     print(f"Bench testset: {args.testset}", flush=True)
+    print(f"Thinking mode: {args.thinking_mode}", flush=True)
     print(f"Max output tokens: {args.max_tokens}", flush=True)
     print(f"First token timeout: {args.first_token_timeout}", flush=True)
     print(
@@ -1634,6 +1704,7 @@ def main() -> int:
             first_token_timeout=args.first_token_timeout,
             progress_interval=args.progress_interval,
             estimator=estimator,
+            thinking_mode=args.thinking_mode,
         )
 
     if args.mode in {"bench", "all"}:
@@ -1648,6 +1719,7 @@ def main() -> int:
             first_token_timeout=args.first_token_timeout,
             progress_interval=args.progress_interval,
             estimator=estimator,
+            thinking_mode=args.thinking_mode,
         )
 
     print_smoke_summary(smoke_results)
@@ -1664,6 +1736,7 @@ def main() -> int:
         temperature=args.temperature,
         timeout=args.timeout,
         first_token_timeout=args.first_token_timeout,
+        thinking_mode=args.thinking_mode,
         environment=environment,
         estimator=estimator,
         smoke_results=smoke_results,
